@@ -78,6 +78,28 @@ jobs:
             exit 1
           }
 
+          # Xcalibur 4.14 does not automatically descend into the KernelSU
+          # directory created by setup.sh. Wire the ReSukiSU driver into the
+          # normal drivers/ Kbuild path explicitly.
+          rm -rf drivers/kernelsu
+          ln -s ../KernelSU/kernel drivers/kernelsu
+
+          if ! grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile; then
+            printf '\n# ReSukiSU / KernelSU\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          fi
+
+          # Kconfig is already sourced by setup.sh on this tree. If it is not,
+          # source the symlinked driver Kconfig once.
+          if ! grep -RqsE 'source[[:space:]]+"(KernelSU/kernel|drivers/kernelsu)/Kconfig"' . --include='Kconfig'; then
+            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+          fi
+
+          test -f drivers/kernelsu/Kbuild
+          grep -q 'obj-$(CONFIG_KSU)' drivers/kernelsu/Kbuild
+          echo "===== ReSukiSU Kbuild wiring ====="
+          grep -n 'kernelsu/' drivers/Makefile || true
+          ls -l drivers/kernelsu
+
       - name: Download and apply SUSFS 2.3 kernel patches
         run: |
           set -e
@@ -266,8 +288,18 @@ jobs:
           make O=out olddefconfig CLANG_TRIPLE=aarch64-linux-gnu-
 
           echo "===== Final KSU / SUSFS config ====="
-          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_OVERLAY_FS)' out/.config || true
+          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_OVERLAY_FS)' out/.config || true
           echo "===================================="
+
+          # ReSukiSU treats CONFIG_KSU_SUSFS as the hook method for this build.
+          if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config || grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' out/.config; then
+            echo "::error::A second KernelSU hook method is enabled together with SUSFS."
+            exit 1
+          fi
+
+          # Fail early if Kbuild lost the driver wiring.
+          test -L drivers/kernelsu
+          grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile
 
           required=(
             CONFIG_THREAD_INFO_IN_TASK
