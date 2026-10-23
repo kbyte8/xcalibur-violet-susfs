@@ -87,16 +87,92 @@ jobs:
           curl -fL --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o ../susfs-inline-hooks.sh
           chmod +x ../susfs-inline-hooks.sh
 
-          echo "Applying main 4.14 SUSFS patch and capturing rejects..."
+          echo "Applying main 4.14 SUSFS patch..."
           set +e
           patch -p1 --forward --batch < ../susfs-4.14.patch 2>&1 | tee ../susfs-main-patch.log
           PATCH_RC=${PIPESTATUS[0]}
           set -e
 
+          # Xcalibur branch 17 has two known source-layout differences from the
+          # generic 4.14 SUSFS patch. Adapt only these two rejects.
           if [ "$PATCH_RC" -ne 0 ]; then
-            echo "::error::SUSFS 4.14 patch does not apply cleanly to this Xcalibur source."
-            echo "===== Reject files ====="
-            find . -name '*.rej' -print -exec sh -c 'echo "--- $1 ---"; cat "$1"' _ {} \; || true
+            mapfile -t rejects < <(find . -name '*.rej' -print | sort)
+            printf 'Rejects found:\n%s\n' "${rejects[*]}"
+
+            expected1='./fs/proc/cmdline.c.rej'
+            expected2='./fs/proc/task_mmu.c.rej'
+            if [ "${#rejects[@]}" -ne 2 ] || \
+               [ "${rejects[0]}" != "$expected1" ] || \
+               [ "${rejects[1]}" != "$expected2" ]; then
+              echo "::error::Unexpected SUSFS patch rejects. Refusing to continue."
+              for f in "${rejects[@]}"; do
+                echo "===== $f ====="
+                cat "$f"
+              done
+              exit 1
+            fi
+
+            echo "Applying Xcalibur-specific merge for /proc/cmdline and task_mmu include..."
+            python3 - <<'PYFIX'
+          from pathlib import Path
+          
+          p = Path('fs/proc/cmdline.c')
+          s = p.read_text()
+          
+          decls = '''
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
+          extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
+          #endif
+          '''
+          if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
+              anchor = '#include <asm/setup.h>\n'
+              if anchor not in s:
+                  raise SystemExit('cmdline.c: include anchor not found')
+              s = s.replace(anchor, anchor + decls, 1)
+          
+          spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          \tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
+          \t\tsusfs_spoof_cmdline_or_bootconfig(m);
+          \t\tseq_putc(m, '\\n');
+          \t\treturn 0;
+          \t}
+          #endif
+          '''
+          fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
+          if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
+              if fn not in s:
+                  raise SystemExit('cmdline.c: cmdline_proc_show anchor not found')
+              s = s.replace(fn, fn + spoof, 1)
+          p.write_text(s)
+          
+          p = Path('fs/proc/task_mmu.c')
+          s = p.read_text()
+          inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          #include <linux/susfs_def.h>
+          #endif // #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          '''
+          if '#include <linux/susfs_def.h>' not in s:
+              anchor = '#include <linux/ctype.h>\n'
+              if anchor not in s:
+                  raise SystemExit('task_mmu.c: include anchor not found')
+              s = s.replace(anchor, anchor + inc, 1)
+          p.write_text(s)
+          PYFIX
+
+            rm -f fs/proc/cmdline.c.rej fs/proc/task_mmu.c.rej
+            grep -q 'susfs_spoof_cmdline_or_bootconfig(m)' fs/proc/cmdline.c || { echo "::error::Xcalibur cmdline SUSFS merge failed"; exit 1; }
+            grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c || { echo "::error::Xcalibur task_mmu SUSFS merge failed"; exit 1; }
+          fi
+
+          REJECTS="$(find . -name '*.rej' -print)"
+          if [ -n "$REJECTS" ]; then
+            echo "::error::Unexpected patch reject files remain:"
+            echo "$REJECTS"
+            for f in $REJECTS; do
+              echo "===== $f ====="
+              cat "$f"
+            done
             exit 1
           fi
 
@@ -108,7 +184,6 @@ jobs:
             exit 1
           fi
 
-          # These are core legacy hooks expected on a 4.14 ReSukiSU/SUSFS build.
           grep -q 'ksu_handle_execveat_sucompat' fs/exec.c || { echo "::error::exec hook missing"; exit 1; }
           grep -q 'ksu_handle_faccessat' fs/open.c || { echo "::error::faccessat hook missing"; exit 1; }
           grep -q 'ksu_handle_stat' fs/stat.c || { echo "::error::stat hook missing"; exit 1; }
@@ -116,18 +191,6 @@ jobs:
           grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || { echo "::error::reboot hook missing"; exit 1; }
 
           sha256sum ../susfs-4.14.patch ../susfs-inline-hooks.sh > ../susfs-patches.sha256
-
-          REJECTS="$(find . -name '*.rej' -print)"
-          if [ -n "$REJECTS" ]; then
-            echo "::error::Patch reject files were created:"
-            echo "$REJECTS"
-            for f in $REJECTS; do
-              echo "===== $f ====="
-              cat "$f"
-            done
-            exit 1
-          fi
-
           test -f fs/susfs.c
           test -f include/linux/susfs.h
           grep -q 'SUSFS_VERSION' include/linux/susfs.h
