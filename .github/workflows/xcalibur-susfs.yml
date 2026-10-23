@@ -175,51 +175,51 @@ jobs:
 
             echo "Applying Xcalibur-specific merge for /proc/cmdline and task_mmu include..."
             python3 - <<'PYFIX'
-from pathlib import Path
-
-p = Path('fs/proc/cmdline.c')
-s = p.read_text()
-
-decls = '''
-#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
-extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
-#endif
-'''
-if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
-    anchor = '#include <asm/setup.h>\n'
-    if anchor not in s:
-        raise SystemExit('cmdline.c: include anchor not found')
-    s = s.replace(anchor, anchor + decls, 1)
-
-spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-\tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
-\t\tsusfs_spoof_cmdline_or_bootconfig(m);
-\t\tseq_putc(m, '\\n');
-\t\treturn 0;
-\t}
-#endif
-'''
-fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
-if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
-    if fn not in s:
-        raise SystemExit('cmdline.c: cmdline_proc_show anchor not found')
-    s = s.replace(fn, fn + spoof, 1)
-p.write_text(s)
-
-p = Path('fs/proc/task_mmu.c')
-s = p.read_text()
-inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
-#include <linux/susfs_def.h>
-#endif // SUSFS task_mmu helpers
-'''
-if '#include <linux/susfs_def.h>' not in s:
-    anchor = '#include <linux/ctype.h>\n'
-    if anchor not in s:
-        raise SystemExit('task_mmu.c: include anchor not found')
-    s = s.replace(anchor, anchor + inc, 1)
-p.write_text(s)
-PYFIX
+          from pathlib import Path
+          
+          p = Path('fs/proc/cmdline.c')
+          s = p.read_text()
+          
+          decls = '''
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
+          extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
+          #endif
+          '''
+          if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
+              anchor = '#include <asm/setup.h>\n'
+              if anchor not in s:
+                  raise SystemExit('cmdline.c: include anchor not found')
+              s = s.replace(anchor, anchor + decls, 1)
+          
+          spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          \tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
+          \t\tsusfs_spoof_cmdline_or_bootconfig(m);
+          \t\tseq_putc(m, '\\n');
+          \t\treturn 0;
+          \t}
+          #endif
+          '''
+          fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
+          if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
+              if fn not in s:
+                  raise SystemExit('cmdline.c: cmdline_proc_show anchor not found')
+              s = s.replace(fn, fn + spoof, 1)
+          p.write_text(s)
+          
+          p = Path('fs/proc/task_mmu.c')
+          s = p.read_text()
+          inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          #include <linux/susfs_def.h>
+          #endif // SUSFS task_mmu helpers
+          '''
+          if '#include <linux/susfs_def.h>' not in s:
+              anchor = '#include <linux/ctype.h>\n'
+              if anchor not in s:
+                  raise SystemExit('task_mmu.c: include anchor not found')
+              s = s.replace(anchor, anchor + inc, 1)
+          p.write_text(s)
+          PYFIX
 
             rm -f fs/proc/cmdline.c.rej fs/proc/task_mmu.c.rej
             grep -q 'susfs_spoof_cmdline_or_bootconfig(m)' fs/proc/cmdline.c || { echo "::error::Xcalibur cmdline SUSFS merge failed"; exit 1; }
