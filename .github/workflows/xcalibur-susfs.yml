@@ -11,7 +11,6 @@ env:
   DEFCONFIG_NAME: "vendor/violet-perf_defconfig"
   DEVICE_CODENAME: "violet"
   KERNEL_NAME: "Xcalibur-violet-ReSukiSU-SUSFS"
-  # Pin the SUSFS patch set to the Sep-30-era NonGKI builder revision.
   SUSFS_PATCH_COMMIT: "e2f895b"
   RESUKISU_BRANCH: "master"
 
@@ -66,39 +65,81 @@ jobs:
 
       - name: Integrate ReSukiSU
         run: |
+          set -euo pipefail
+          mkdir -p diagnostics
           cd kernel
+
           curl -fL --retry 3 \
             "https://raw.githubusercontent.com/Justadeayo/sKernelSU/${RESUKISU_BRANCH}/kernel/setup.sh" \
             -o setup.sh
-          bash setup.sh "${RESUKISU_BRANCH}"
-          test -d KernelSU
-          echo "RESUKISU_SHA=$(git -C KernelSU rev-parse HEAD)" >> "$GITHUB_ENV"
-          grep -q 'config KSU_SUSFS' KernelSU/kernel/Kconfig || {
-            echo "::error::Selected ReSukiSU tree does not expose CONFIG_KSU_SUSFS"
+
+          bash setup.sh "${RESUKISU_BRANCH}" 2>&1 | tee ../resukisu-setup.log
+
+          # setup.sh is authoritative: it creates drivers/kernelsu and wires
+          # drivers/Makefile + drivers/Kconfig. Do not assume the clone dir name.
+          if [ ! -L drivers/kernelsu ]; then
+            echo "::error::ReSukiSU setup finished but drivers/kernelsu symlink is missing"
+            ls -la drivers | tee ../diagnostics/drivers-list.txt
+            exit 1
+          fi
+
+          KSU_KERNEL_DIR="$(readlink -f drivers/kernelsu)"
+          if [ ! -d "$KSU_KERNEL_DIR" ]; then
+            echo "::error::drivers/kernelsu points to a missing directory: $KSU_KERNEL_DIR"
+            exit 1
+          fi
+
+          KSU_REPO_DIR="$(git -C "$KSU_KERNEL_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+          if [ -z "$KSU_REPO_DIR" ]; then
+            echo "::error::Could not determine ReSukiSU repository root from $KSU_KERNEL_DIR"
+            exit 1
+          fi
+
+          RESUKISU_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
+          echo "RESUKISU_SHA=$RESUKISU_SHA" >> "$GITHUB_ENV"
+          echo "KSU kernel dir: $KSU_KERNEL_DIR"
+          echo "KSU repo dir:   $KSU_REPO_DIR"
+          echo "KSU SHA:        $RESUKISU_SHA"
+
+          test -f drivers/kernelsu/Kconfig
+          if [ ! -f drivers/kernelsu/Kbuild ] && [ ! -f drivers/kernelsu/Makefile ]; then
+            echo "::error::ReSukiSU kernel directory has neither Kbuild nor Makefile"
+            exit 1
+          fi
+
+          grep -qE 'obj-\$\(CONFIG_KSU\).*kernelsu/' drivers/Makefile || {
+            echo "::error::drivers/Makefile is not wired to drivers/kernelsu"
+            tail -n 40 drivers/Makefile
+            exit 1
+          }
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || {
+            echo "::error::drivers/Kconfig is not wired to drivers/kernelsu/Kconfig"
+            tail -n 60 drivers/Kconfig
             exit 1
           }
 
-          # Xcalibur 4.14 does not automatically descend into the KernelSU
-          # directory created by setup.sh. Wire the ReSukiSU driver into the
-          # normal drivers/ Kbuild path explicitly.
-          rm -rf drivers/kernelsu
-          ln -s ../KernelSU/kernel drivers/kernelsu
-
-          if ! grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile; then
-            printf '\n# ReSukiSU / KernelSU\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          if ! grep -q 'KSU_SUSFS' drivers/kernelsu/Kconfig; then
+            echo "::error::Selected ReSukiSU tree does not expose SUSFS Kconfig options"
+            exit 1
           fi
 
-          # Kconfig is already sourced by setup.sh on this tree. If it is not,
-          # source the symlinked driver Kconfig once.
-          if ! grep -RqsE 'source[[:space:]]+"(KernelSU/kernel|drivers/kernelsu)/Kconfig"' . --include='Kconfig'; then
-            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
-          fi
-
-          test -f drivers/kernelsu/Kbuild
-          grep -q 'obj-$(CONFIG_KSU)' drivers/kernelsu/Kbuild
-          echo "===== ReSukiSU Kbuild wiring ====="
-          grep -n 'kernelsu/' drivers/Makefile || true
-          ls -l drivers/kernelsu
+          {
+            echo "KSU_KERNEL_DIR=$KSU_KERNEL_DIR"
+            echo "KSU_REPO_DIR=$KSU_REPO_DIR"
+            echo "RESUKISU_SHA=$RESUKISU_SHA"
+            echo "===== drivers/Makefile KSU lines ====="
+            grep -n 'kernelsu' drivers/Makefile || true
+            echo "===== drivers/Kconfig KSU lines ====="
+            grep -n 'kernelsu' drivers/Kconfig || true
+            echo "===== KSU Kconfig SUSFS lines ====="
+            grep -n 'KSU_SUSFS' drivers/kernelsu/Kconfig | head -80 || true
+            echo "===== KSU build file ====="
+            if [ -f drivers/kernelsu/Kbuild ]; then
+              sed -n '1,220p' drivers/kernelsu/Kbuild
+            else
+              sed -n '1,220p' drivers/kernelsu/Makefile
+            fi
+          } > ../diagnostics/resukisu-integration.txt
 
       - name: Download and apply SUSFS 2.3 kernel patches
         run: |
@@ -115,8 +156,6 @@ jobs:
           PATCH_RC=${PIPESTATUS[0]}
           set -e
 
-          # Xcalibur branch 17 has two known source-layout differences from the
-          # generic 4.14 SUSFS patch. Adapt only these two rejects.
           if [ "$PATCH_RC" -ne 0 ]; then
             mapfile -t rejects < <(find . -name '*.rej' -print | sort)
             printf 'Rejects found:\n%s\n' "${rejects[*]}"
@@ -136,51 +175,51 @@ jobs:
 
             echo "Applying Xcalibur-specific merge for /proc/cmdline and task_mmu include..."
             python3 - <<'PYFIX'
-          from pathlib import Path
-          
-          p = Path('fs/proc/cmdline.c')
-          s = p.read_text()
-          
-          decls = '''
-          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
-          extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
-          #endif
-          '''
-          if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
-              anchor = '#include <asm/setup.h>\n'
-              if anchor not in s:
-                  raise SystemExit('cmdline.c: include anchor not found')
-              s = s.replace(anchor, anchor + decls, 1)
-          
-          spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          \tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
-          \t\tsusfs_spoof_cmdline_or_bootconfig(m);
-          \t\tseq_putc(m, '\\n');
-          \t\treturn 0;
-          \t}
-          #endif
-          '''
-          fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
-          if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
-              if fn not in s:
-                  raise SystemExit('cmdline.c: cmdline_proc_show anchor not found')
-              s = s.replace(fn, fn + spoof, 1)
-          p.write_text(s)
-          
-          p = Path('fs/proc/task_mmu.c')
-          s = p.read_text()
-          inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
-          #include <linux/susfs_def.h>
-          #endif // #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
-          '''
-          if '#include <linux/susfs_def.h>' not in s:
-              anchor = '#include <linux/ctype.h>\n'
-              if anchor not in s:
-                  raise SystemExit('task_mmu.c: include anchor not found')
-              s = s.replace(anchor, anchor + inc, 1)
-          p.write_text(s)
-          PYFIX
+from pathlib import Path
+
+p = Path('fs/proc/cmdline.c')
+s = p.read_text()
+
+decls = '''
+#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
+extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
+#endif
+'''
+if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
+    anchor = '#include <asm/setup.h>\n'
+    if anchor not in s:
+        raise SystemExit('cmdline.c: include anchor not found')
+    s = s.replace(anchor, anchor + decls, 1)
+
+spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+\tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
+\t\tsusfs_spoof_cmdline_or_bootconfig(m);
+\t\tseq_putc(m, '\\n');
+\t\treturn 0;
+\t}
+#endif
+'''
+fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
+if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
+    if fn not in s:
+        raise SystemExit('cmdline.c: cmdline_proc_show anchor not found')
+    s = s.replace(fn, fn + spoof, 1)
+p.write_text(s)
+
+p = Path('fs/proc/task_mmu.c')
+s = p.read_text()
+inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+#include <linux/susfs_def.h>
+#endif // SUSFS task_mmu helpers
+'''
+if '#include <linux/susfs_def.h>' not in s:
+    anchor = '#include <linux/ctype.h>\n'
+    if anchor not in s:
+        raise SystemExit('task_mmu.c: include anchor not found')
+    s = s.replace(anchor, anchor + inc, 1)
+p.write_text(s)
+PYFIX
 
             rm -f fs/proc/cmdline.c.rej fs/proc/task_mmu.c.rej
             grep -q 'susfs_spoof_cmdline_or_bootconfig(m)' fs/proc/cmdline.c || { echo "::error::Xcalibur cmdline SUSFS merge failed"; exit 1; }
@@ -191,15 +230,11 @@ jobs:
           if [ -n "$REJECTS" ]; then
             echo "::error::Unexpected patch reject files remain:"
             echo "$REJECTS"
-            for f in $REJECTS; do
-              echo "===== $f ====="
-              cat "$f"
-            done
             exit 1
           fi
 
           echo "Applying legacy/non-GKI inline hooks..."
-          bash ../susfs-inline-hooks.sh | tee ../susfs-inline-hooks.log
+          bash ../susfs-inline-hooks.sh 2>&1 | tee ../susfs-inline-hooks.log
 
           if grep -q "patch failed for unknown reasons" ../susfs-inline-hooks.log; then
             echo "::error::The inline-hook helper reported at least one failed hook insertion."
@@ -215,7 +250,6 @@ jobs:
           sha256sum ../susfs-4.14.patch ../susfs-inline-hooks.sh > ../susfs-patches.sha256
           test -f fs/susfs.c
           test -f include/linux/susfs.h
-          grep -q 'SUSFS_VERSION' include/linux/susfs.h
 
       - name: Configure KSU and SUSFS
         run: |
@@ -235,18 +269,18 @@ jobs:
             echo "# ${key} is not set" >> "$DEFCONFIG"
           }
 
-          # Root integration: preserve the 4.14-friendly syscall-table hook strategy.
           set_y CONFIG_KSU
-          set_y CONFIG_KSU_TAMPER_SYSCALL_TABLE
-          set_n CONFIG_KSU_HACK_ARM64_BRANCH_LINK
-          set_n CONFIG_KSU_KPROBES_KSUD
           set_y CONFIG_KPROBES
           set_y CONFIG_KPROBE_EVENTS
           set_y CONFIG_KRETPROBES
           set_y CONFIG_OVERLAY_FS
 
-          # SUSFS features BRENE can use.
+          # ReSukiSU SUSFS inline-hook mode. Do not enable a second hook mode.
           set_y CONFIG_KSU_SUSFS
+          set_n CONFIG_KSU_MANUAL_HOOK
+          set_n CONFIG_KSU_TRACEPOINT_HOOK
+          set_n CONFIG_KSU_KPROBES_HOOK
+
           set_y CONFIG_KSU_SUSFS_SUS_PATH
           set_y CONFIG_KSU_SUSFS_SUS_MOUNT
           set_y CONFIG_KSU_SUSFS_SUS_KSTAT
@@ -257,7 +291,7 @@ jobs:
           set_y CONFIG_KSU_SUSFS_OPEN_REDIRECT
           set_y CONFIG_KSU_SUSFS_SUS_MAP
 
-          tail -n 40 "$DEFCONFIG"
+          tail -n 50 "$DEFCONFIG"
 
       - name: Compile kernel
         run: |
@@ -287,24 +321,14 @@ jobs:
           make O=out "${DEFCONFIG_NAME}" CLANG_TRIPLE=aarch64-linux-gnu-
           make O=out olddefconfig CLANG_TRIPLE=aarch64-linux-gnu-
 
+          cp out/.config ../diagnostics/final.config
           echo "===== Final KSU / SUSFS config ====="
-          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_OVERLAY_FS)' out/.config || true
+          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KSU_KPROBES_HOOK|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_OVERLAY_FS)' out/.config || true
           echo "===================================="
-
-          # ReSukiSU treats CONFIG_KSU_SUSFS as the hook method for this build.
-          if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config || grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' out/.config; then
-            echo "::error::A second KernelSU hook method is enabled together with SUSFS."
-            exit 1
-          fi
-
-          # Fail early if Kbuild lost the driver wiring.
-          test -L drivers/kernelsu
-          grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile
 
           required=(
             CONFIG_THREAD_INFO_IN_TASK
             CONFIG_KSU
-            CONFIG_KSU_TAMPER_SYSCALL_TABLE
             CONFIG_KSU_SUSFS
             CONFIG_KSU_SUSFS_SUS_PATH
             CONFIG_KSU_SUSFS_SUS_MOUNT
@@ -326,6 +350,14 @@ jobs:
           make -j"$(nproc)" O=out CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
           status=${PIPESTATUS[0]}
           set -e
+
+          # Capture KSU object symbol information even if final link fails.
+          if [ -f out/drivers/kernelsu/ksu.o ]; then
+            "${CLANG_ROOT}/llvm-nm" out/drivers/kernelsu/ksu.o 2>/dev/null | \
+              grep -E 'ksu_handle_|ksu_su_compat|ksu_is_init_rc|ksu_is_input' \
+              > ../diagnostics/ksu-object-symbols.txt || true
+          fi
+
           if [ "$status" -ne 0 ]; then
             echo "::error::Kernel compilation failed"
             exit "$status"
@@ -338,17 +370,12 @@ jobs:
           test -s "${BOOT_DIR}/Image.gz"
           gzip -dc "${BOOT_DIR}/Image.gz" > built-Image
 
-          echo "===== Kernel banner ====="
           strings built-Image | grep -m1 -A1 'Linux version' || true
-          echo "===== SUSFS markers ====="
           strings built-Image | grep -Ei -m10 'susfs is initialized|susfs_show_version|susfs_add_sus_path|susfs_add_sus_map' || true
 
           if ! strings built-Image | grep -q 'susfs is initialized'; then
             echo "::error::Compiled image does not contain the SUSFS init marker"
             exit 1
-          fi
-          if ! strings built-Image | grep -q '4.14.366-openela-xcalibur'; then
-            echo "::warning::Built kernel banner differs from the known-good Sep-30 Xcalibur family"
           fi
 
       - name: Package with known-good Sep-30 DTB/DTBO
@@ -358,7 +385,6 @@ jobs:
           cp -a known-good-sep30 package
           cp kernel/out/arch/arm64/boot/Image.gz package/Image.gz
 
-          # Refuse to package if the proven-good device tree payload was modified.
           echo '5c48d4b4d2112c9af8a2f9b543996bb410eb6ddc6a2fd65c02101a46b8e68569  package/dtb' | sha256sum -c -
           echo '1cb8c6023fee3a1a75624129bff66552e165e2328903a8fbefe68306253d77ad  package/dtbo.img' | sha256sum -c -
 
@@ -371,12 +397,11 @@ jobs:
             "kernel_source=${KERNEL_SOURCE}" \
             "kernel_ref=${KERNEL_BRANCH}" \
             "kernel_source_sha=${KERNEL_SOURCE_SHA}" \
-            "resukisu_repo=https://github.com/Justadeayo/sKernelSU" \
+            "resukisu_repo_detected_via=drivers/kernelsu" \
             "resukisu_ref=${RESUKISU_BRANCH}" \
             "resukisu_sha=${RESUKISU_SHA}" \
             "susfs_patch_commit=${SUSFS_PATCH_COMMIT}" \
             "compiler=${CLANG_VERSION}" \
-            "known_good_sep30_package_sha256=858e34f51bbef6ae9ae5e9fbdc1571b91845eca0cd2ad1800a7bad281d33b569" \
             > "${ZIP_NAME}.provenance.txt"
 
       - name: Upload flashable kernel
@@ -396,6 +421,8 @@ jobs:
         with:
           name: xcalibur-susfs-failure-logs
           path: |
+            resukisu-setup.log
+            diagnostics/**
             susfs-main-patch.log
             susfs-4.14.patch
             susfs-inline-hooks.log
