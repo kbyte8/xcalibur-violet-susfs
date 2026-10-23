@@ -1,541 +1,342 @@
-name: Xcalibur Violet - Sep11 KernelSU + SUSFS 4.14
+name: Xcalibur Violet SUSFS Autopilot
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
-  TZ: "Africa/Lagos"
-  CLANG_VERSION: "clang-r416183b"
-  KERNEL_SOURCE: "https://github.com/Justadeayo/android_kernel_xiaomi_violet"
+  KERNEL_REPO: https://github.com/Justadeayo/android_kernel_xiaomi_violet
   KERNEL_BRANCH: "17"
-  KERNEL_BUILD_TIME: "2026-09-30T01:25:49+01:00"
-  KSU_SOURCE: "https://github.com/Justadeayo/KernelSU"
-  KSU_REF: "6005b0cba6d33fa3e43a4112ce872e66420c6163"
-  SUSFS_PATCH_SOURCE: "https://github.com/sanba0519/Kernel-patch"
-  SUSFS_PATCH_TIME: "2026-09-11T09:36:41+01:00"
-  DEFCONFIG_NAME: "vendor/violet-perf_defconfig"
-  DEVICE_CODENAME: "violet"
-  KERNEL_NAME: "Xcalibur-violet-KernelSU-SUSFS"
+  DEFCONFIG: vendor/violet-perf_defconfig
+  CLANG_VERSION: clang-r416183b
+  SUSFS_PATCH_COMMIT: e2f895b
+  DEVICE: violet
 
 jobs:
   build:
+    name: BakaSU ${{ matrix.bakasu_ref }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: read
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        bakasu_ref:
+          - v4.2.0-rc3
+          - main
 
     steps:
-      - name: Checkout builder
+      - name: Checkout this repository
         uses: actions/checkout@v4
 
-      - name: Initialize diagnostics
+      - name: Prepare diagnostics
+        shell: bash
         run: |
           mkdir -p diagnostics
-          {
-            echo "workflow=v8-sep11-kernelsu-susfs"
-            echo "kernel_source=${KERNEL_SOURCE}"
-            echo "kernel_branch=${KERNEL_BRANCH}"
-            echo "kernel_before=${KERNEL_BUILD_TIME}"
-            echo "ksu_source=${KSU_SOURCE}"
-            echo "ksu_ref=${KSU_REF}"
-            echo "susfs_patch_source=${SUSFS_PATCH_SOURCE}"
-            echo "susfs_patch_before=${SUSFS_PATCH_TIME}"
-          } > diagnostics/build-plan.txt
-
-      - name: Setup swap
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 16
-
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: xcalibur-violet-sep11-ksu-susfs-v8
-          max-size: 5G
+          : > diagnostics/summary.txt
+          echo "bakasu_ref=${{ matrix.bakasu_ref }}" >> diagnostics/summary.txt
 
       - name: Install build dependencies
+        shell: bash
         run: |
           sudo rm -rf /etc/apt/sources.list.d/*
           sudo apt-get -o Acquire::Timeout="10" -o Acquire::Retries="2" update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev libdw-dev build-essential \
-            lz4 git python3 curl dwarves cpio lld gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi zip patch
+            git python3 curl cpio lld gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi zip patch xz-utils
 
-      - name: Checkout Sep-30-era Xcalibur source
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: xcalibur-bakasu-${{ matrix.bakasu_ref }}
+          max-size: 5G
+
+      - name: Clone Xcalibur source and pin to Sep-30-era state
+        shell: bash
         run: |
-          set -euo pipefail
-          rm -rf kernel
-          git clone --filter=blob:none --no-checkout "${KERNEL_SOURCE}" kernel
+          set -euxo pipefail
+          git clone --filter=blob:none --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           cd kernel
-          git fetch --force origin "${KERNEL_BRANCH}:refs/remotes/origin/${KERNEL_BRANCH}"
-          KERNEL_SHA="$(git rev-list -1 --before="${KERNEL_BUILD_TIME}" "origin/${KERNEL_BRANCH}")"
-          if [ -z "$KERNEL_SHA" ]; then
-            echo "::error::Could not resolve historical kernel commit"
+          # Use the last branch-17 commit at/before the known working Sep-30 build time.
+          TARGET_SHA="$(git rev-list -1 --before='2026-09-30 01:25:49 +0100' "origin/$KERNEL_BRANCH")"
+          if [ -z "$TARGET_SHA" ]; then
+            echo "Could not resolve Sep-30-era kernel commit" >&2
             exit 1
           fi
-          git checkout --detach "$KERNEL_SHA"
-          echo "KERNEL_SOURCE_SHA=$KERNEL_SHA" >> "$GITHUB_ENV"
+          git checkout "$TARGET_SHA"
+          echo "KERNEL_SHA=$TARGET_SHA" >> "$GITHUB_ENV"
           {
-            echo "kernel_source_sha=$KERNEL_SHA"
-            echo "kernel_commit=$(git show -s --format='%cI | %s' "$KERNEL_SHA")"
+            echo "kernel_sha=$TARGET_SHA"
             echo "kernel_version=$(make kernelversion)"
-          } >> ../diagnostics/build-plan.txt
-          git show -s --format=fuller "$KERNEL_SHA" | tee ../diagnostics/kernel-commit.txt
-          make kernelversion
+          } >> "$GITHUB_WORKSPACE/diagnostics/summary.txt"
 
-      - name: Download Sep-30 Clang
+      - name: Download Sep-30 compiler family
+        shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "toolchains/${CLANG_VERSION}"
+          set -euxo pipefail
+          mkdir -p toolchains
           git clone --depth=1 \
             https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git \
-            "toolchains/${CLANG_VERSION}"
-          test -x "toolchains/${CLANG_VERSION}/bin/clang"
-          "toolchains/${CLANG_VERSION}/bin/clang" --version | head -n1 | tee diagnostics/clang.txt
+            "toolchains/$CLANG_VERSION"
+          "toolchains/$CLANG_VERSION/bin/clang" --version | head -n 1 | tee diagnostics/clang.txt
 
-      - name: Integrate Sep-11-era Justadeayo KernelSU
+      - name: Integrate BakaSU
+        shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           cd kernel
-          rm -rf KernelSU drivers/kernelsu
-          git clone --filter=blob:none "${KSU_SOURCE}" KernelSU
-          git -C KernelSU checkout --detach "${KSU_REF}"
-          KSU_SHA="$(git -C KernelSU rev-parse HEAD)"
-          echo "KSU_SHA=$KSU_SHA" >> "$GITHUB_ENV"
+          curl -fL --retry 3 \
+            "https://raw.githubusercontent.com/Baka-SU/BakaSU/${{ matrix.bakasu_ref }}/kernel/setup.sh" \
+            -o setup-bakasu.sh
+          bash setup-bakasu.sh "${{ matrix.bakasu_ref }}" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/bakasu-setup.log"
 
-          ln -s ../KernelSU/kernel drivers/kernelsu
-          if ! grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\).*kernelsu/' drivers/Makefile; then
-            printf '\n# KernelSU\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
-          fi
-          if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
-            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
-          fi
+          test -e drivers/kernelsu
+          REAL_KSU="$(readlink -f drivers/kernelsu || true)"
+          echo "bakasu_real_path=$REAL_KSU" >> "$GITHUB_WORKSPACE/diagnostics/summary.txt"
+          grep -R "config KSU_SUSFS" -n drivers/kernelsu/Kconfig | tee "$GITHUB_WORKSPACE/diagnostics/bakasu-kconfig.txt"
 
-          {
-            echo "ksu_sha=$KSU_SHA"
-            echo "ksu_commit=$(git -C KernelSU show -s --format='%cI | %s' "$KSU_SHA")"
-            echo "===== KernelSU version lines ====="
-            grep -nE 'KSU_VERSION|VERSION_TAG' KernelSU/kernel/Makefile KernelSU/Makefile 2>/dev/null || true
-            echo "===== SUSFS Kconfig in Sep-11-era KernelSU ====="
-            grep -Rns 'config KSU_SUSFS' KernelSU/kernel 2>/dev/null || true
-          } | tee ../diagnostics/kernelsu-sep11.txt
-
-          if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KSU_SUSFS([[:space:]]|$)' KernelSU/kernel; then
-            echo "::error::Sep-11-era Justadeayo KernelSU does not expose CONFIG_KSU_SUSFS"
-            exit 1
-          fi
-
-          test -f drivers/kernelsu/Kconfig
-          test -f drivers/kernelsu/Makefile -o -f drivers/kernelsu/Kbuild
-
-      - name: Recover maintainer historical SUSFS 4.14 patch
+      - name: Apply SUSFS 4.14 kernel-side backport
+        shell: bash
         run: |
-          set -euo pipefail
-          rm -rf historical-susfs-patch
-          git clone --filter=blob:none "${SUSFS_PATCH_SOURCE}" historical-susfs-patch
-          PATCH_SHA="$(git -C historical-susfs-patch rev-list -1 --before="${SUSFS_PATCH_TIME}" origin/main 2>/dev/null || true)"
-          if [ -z "$PATCH_SHA" ]; then
-            PATCH_SHA="$(git -C historical-susfs-patch rev-list -1 --before="${SUSFS_PATCH_TIME}" origin/master 2>/dev/null || true)"
-          fi
-          if [ -z "$PATCH_SHA" ]; then
-            echo "::error::Could not resolve historical sanba0519/Kernel-patch commit"
-            exit 1
-          fi
-          git -C historical-susfs-patch checkout --detach "$PATCH_SHA"
-          echo "SUSFS_PATCH_SHA=$PATCH_SHA" >> "$GITHUB_ENV"
-
-          PATCH_FILE="historical-susfs-patch/susfs_patch_to_4.14.patch"
-          if [ ! -s "$PATCH_FILE" ]; then
-            echo "::error::Historical repo does not contain susfs_patch_to_4.14.patch"
-            find historical-susfs-patch -maxdepth 2 -type f -print > diagnostics/historical-patch-files.txt
-            exit 1
-          fi
-          cp "$PATCH_FILE" susfs-historical-4.14.patch
-          {
-            echo "patch_sha=$PATCH_SHA"
-            git -C historical-susfs-patch show -s --format='%cI | %s' "$PATCH_SHA"
-            echo "===== files touched by patch ====="
-            grep '^+++ ' susfs-historical-4.14.patch || true
-          } | tee diagnostics/historical-susfs-patch.txt
-          sha256sum susfs-historical-4.14.patch > diagnostics/historical-susfs-patch.sha256
-
-      - name: Apply historical SUSFS patch with Xcalibur merges
-        run: |
-          set -euo pipefail
+          set -euxo pipefail
           cd kernel
+          PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/${SUSFS_PATCH_COMMIT}/Patches"
+          curl -fL --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.14.patch" -o ../susfs-4.14.patch
+
           set +e
-          patch -p1 --forward --batch < ../susfs-historical-4.14.patch 2>&1 | tee ../susfs-historical-apply.log
+          patch -p1 --forward --batch < ../susfs-4.14.patch 2>&1 | tee ../diagnostics/susfs-main-patch.log
           PATCH_RC=${PIPESTATUS[0]}
           set -e
 
-          find . -name '*.rej' -print -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \; \
-            > ../diagnostics/historical-patch-rejects.txt || true
+          # Xcalibur has known small layout differences. Handle only known rejects;
+          # abort on anything else so a bad kernel is never packaged.
+          mapfile -t rejects < <(find . -name '*.rej' -print | sort)
+          printf '%s\n' "${rejects[@]}" > ../diagnostics/rejects.txt
 
           if [ "$PATCH_RC" -ne 0 ]; then
-            mapfile -t rejects < <(find . -name '*.rej' -print | sort)
-            printf 'Historical patch returned %s; rejects:\n' "$PATCH_RC"
-            printf '  %s\n' "${rejects[@]}"
-
-            expected=(
-              './fs/namei.c.rej'
-              './fs/notify/fdinfo.c.rej'
-              './fs/proc/cmdline.c.rej'
-              './kernel/sys.c.rej'
-            )
-            if [ "${#rejects[@]}" -ne "${#expected[@]}" ]; then
-              echo "::error::Unexpected number of historical patch rejects"
-              exit 1
-            fi
-            for i in "${!expected[@]}"; do
-              if [ "${rejects[$i]}" != "${expected[$i]}" ]; then
-                echo "::error::Unexpected reject: ${rejects[$i]} (expected ${expected[$i]})"
-                exit 1
-              fi
-            done
-
-            echo "Applying four Xcalibur-specific compatibility merges..."
             python3 - <<'PYFIX'
           from pathlib import Path
+          import sys
 
-          def replace_once(text, old, new, label):
-              if old not in text:
-                  raise SystemExit(f'{label}: anchor not found')
-              return text.replace(old, new, 1)
-
-          p = Path('fs/proc/cmdline.c')
-          s = p.read_text()
-          if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
-              anchor = '#include <asm/setup.h>\n'
-              decls = '#include <asm/setup.h>\n\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;\nextern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n'
-              s = replace_once(s, anchor, decls, 'cmdline declarations')
-          if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
-              fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
-              spoof = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {\n\t\tsusfs_spoof_cmdline_or_bootconfig(m);\n\t\tseq_putc(m, \'\\n\');\n\t\treturn 0;\n\t}\n#endif\n'
-              s = replace_once(s, fn, spoof, 'cmdline show')
-          p.write_text(s)
-
-          p = Path('kernel/sys.c')
-          s = p.read_text()
-          newuname_start = s.index('SYSCALL_DEFINE1(newuname')
-          olduname_start = s.index('#ifdef __ARCH_WANT_SYS_OLD_UNAME', newuname_start)
-          part = s[newuname_start:olduname_start]
-          if 'susfs_spoof_uname(&tmp);' not in part:
-              anchor = '\tmemcpy(&tmp, utsname(), sizeof(tmp));\n'
-              inject = '\tmemcpy(&tmp, utsname(), sizeof(tmp));\n#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tif (static_branch_likely(&susfs_is_uname_spoof_buffer_set))\n\t\tsusfs_spoof_uname(&tmp);\n#endif\n'
-              part = replace_once(part, anchor, inject, 'newuname')
-              s = s[:newuname_start] + part + s[olduname_start:]
-          p.write_text(s)
-
-          p = Path('fs/notify/fdinfo.c')
-          s = p.read_text()
-          fn_start = s.index('static void inotify_fdinfo')
-          fn_end = s.index('void inotify_show_fdinfo', fn_start)
-          part = s[fn_start:fn_end]
-          if 'susfs_is_current_proc_umounted()' not in part:
-              anchor = '\tif (inode) {\n'
-              block = '''\tif (inode) {
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-          \t\tmnt = real_mount(file->f_path.mnt);
-          \t\tif (mnt->mnt_id >= DEFAULT_KSU_MNT_ID &&
-          \t\t\tlikely(susfs_is_current_proc_umounted())) {
-          \t\t\tstruct path path;
-          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
-          \t\t\tchar *dpath;
-          \t\t\tif (!pathname)
-          \t\t\t\tgoto orig_flow;
-          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
-          \t\t\tif (!dpath)
-          \t\t\t\tgoto out_kfree;
-          \t\t\tif (kern_path(dpath, 0, &path))
-          \t\t\t\tgoto out_kfree;
-          \t\t\tif (!path.dentry->d_inode)
-          \t\t\t\tgoto out_path_put;
-          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
-          \t\t\t\tinode_mark->wd, path.dentry->d_inode->i_ino,
-          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, mark->mask & IN_ALL_EVENTS);
-          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
-          \t\t\tseq_putc(m, '\\n');
-          \t\t\tpath_put(&path);
-          \t\t\tkfree(pathname);
-          \t\t\tiput(inode);
-          \t\t\treturn;
-          out_path_put:
-          \t\t\tpath_put(&path);
-          out_kfree:
-          \t\t\tkfree(pathname);
-          orig_flow:;
-          \t\t}
-          #endif
-          '''
-              part = replace_once(part, anchor, block, 'fdinfo inotify body')
-              s = s[:fn_start] + part + s[fn_end:]
-          p.write_text(s)
-
-          p = Path('fs/namei.c')
-          s = p.read_text()
-          tmp_start = s.index('static int do_tmpfile(')
-          opath_start = s.index('static int do_o_path(', tmp_start)
-          tmp = s[tmp_start:opath_start]
-          cleanup_anchor = '\tout:\n\tpath_put(&path);\n\treturn error;\n}\n\n'
-          if cleanup_anchor in tmp:
-              repl = '\tout:\n\tpath_put(&path);\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tif (fake_filename && !IS_ERR(fake_filename))\n\t\tputname(fake_filename);\n#endif\n\treturn error;\n}\n\n'
-              tmp = tmp.replace(cleanup_anchor, repl, 1)
-              s = s[:tmp_start] + tmp + s[opath_start:]
-
-          opath_start = s.index('static int do_o_path(')
-          pathopen_start = s.index('static struct file *path_openat(', opath_start)
-          opath = s[opath_start:pathopen_start]
-          if 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK' not in opath:
-              old = 'static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)\n{\n\tstruct path path;\n\tint error = path_lookupat(nd, flags, &path);\n\tif (!error) {\n\t\taudit_inode(nd->name, path.dentry, 0);\n\t\terror = vfs_open(&path, file);\n\t\tpath_put(&path);\n\t}\n\treturn error;\n}\n\n'
-              new = '''static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
-          {
-          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          \tint old_dfd = nd->dfd;
-          \tstruct filename *fake_filename = NULL;
-          #endif
-          \tstruct path path;
-          \tint error = path_lookupat(nd, flags, &path);
-          \tif (!error) {
-          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          \t\tif (old_dfd != -1 &&
-          \t\t\tSUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(path.dentry->d_inode)) {
-          \t\t\tfake_filename = susfs_open_redirect_spoof_do_sys_openat(path.dentry->d_inode);
-          \t\t\tif (fake_filename && !IS_ERR(fake_filename)) {
-          \t\t\t\tpath_put(&path);
-          \t\t\t\trestore_nameidata();
-          \t\t\t\tset_nameidata(nd, old_dfd, fake_filename);
-          \t\t\t\terror = path_lookupat(nd, flags, &path);
-          \t\t\t\tif (unlikely(error)) {
-          \t\t\t\t\tputname(fake_filename);
-          \t\t\t\t\treturn error;
-          \t\t\t\t}
-          \t\t\t}
-          \t\t}
-          #endif
-          \t\taudit_inode(nd->name, path.dentry, 0);
-          \t\terror = vfs_open(&path, file);
-          \t\tpath_put(&path);
-          \t}
-          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          \tif (fake_filename && !IS_ERR(fake_filename))
-          \t\tputname(fake_filename);
-          #endif
-          \treturn error;
+          rejects = sorted(Path('.').rglob('*.rej'))
+          allowed = {
+              Path('fs/proc/cmdline.c.rej'),
+              Path('fs/proc/task_mmu.c.rej'),
+              Path('fs/namei.c.rej'),
+              Path('fs/notify/fdinfo.c.rej'),
+              Path('kernel/sys.c.rej'),
           }
+          bad = [p for p in rejects if p not in allowed]
+          if bad:
+              print('Unexpected rejects:', *bad, sep='\n', file=sys.stderr)
+              sys.exit(2)
 
-          '''
-              if old not in opath:
-                  raise SystemExit('do_o_path: expected Xcalibur body not found')
-              opath = opath.replace(old, new, 1)
-              s = s[:opath_start] + opath + s[pathopen_start:]
+          # cmdline.c: keep Xcalibur's existing cmdline logic and add SUSFS override first.
+          p = Path('fs/proc/cmdline.c')
+          if p.exists():
+              s = p.read_text()
+              if 'susfs_spoof_cmdline_or_bootconfig' not in s:
+                  anchor = '#include <asm/setup.h>\n'
+                  decl = ('#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n'
+                          'extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;\n'
+                          'extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n'
+                          '#endif\n')
+                  if anchor in s:
+                      s = s.replace(anchor, anchor + decl, 1)
+                  fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
+                  body = ('#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n'
+                          '\tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {\n'
+                          '\t\tsusfs_spoof_cmdline_or_bootconfig(m);\n'
+                          "\t\tseq_putc(m, '\\n');\n"
+                          '\t\treturn 0;\n'
+                          '\t}\n'
+                          '#endif\n')
+                  if fn in s:
+                      s = s.replace(fn, fn + body, 1)
+                  p.write_text(s)
 
-          pathopen_start = s.index('static struct file *path_openat(')
-          if 'int old_dfd = nd->dfd;' not in s[pathopen_start:pathopen_start+500]:
-              anchor = 'static struct file *path_openat(struct nameidata *nd,\n\t\t\tconst struct open_flags *op, unsigned flags)\n{\n'
-              repl = 'static struct file *path_openat(struct nameidata *nd,\n\t\t\tconst struct open_flags *op, unsigned flags)\n{\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tint old_dfd = nd->dfd;\n\tstruct filename *fake_filename = NULL;\n#endif\n'
-              s = replace_once(s, anchor, repl, 'path_openat declarations')
-          p.write_text(s)
+          # task_mmu.c: add SUSFS definitions include if absent.
+          p = Path('fs/proc/task_mmu.c')
+          if p.exists():
+              s = p.read_text()
+              if '#include <linux/susfs_def.h>' not in s:
+                  for anchor in ('#include <linux/ctype.h>\n', '#include <linux/mm.h>\n'):
+                      if anchor in s:
+                          inc = ('#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n'
+                                 '#include <linux/susfs_def.h>\n'
+                                 '#endif\n')
+                          s = s.replace(anchor, anchor + inc, 1)
+                          break
+                  p.write_text(s)
+
+          # For the other known Xcalibur rejects, require the surrounding SUSFS symbols
+          # to already exist from successfully applied hunks; otherwise stop here.
+          checks = {
+              Path('fs/namei.c.rej'): ('fs/namei.c', 'susfs'),
+              Path('fs/notify/fdinfo.c.rej'): ('fs/notify/fdinfo.c', 'susfs'),
+              Path('kernel/sys.c.rej'): ('kernel/sys.c', 'susfs'),
+          }
+          for rej, (src, marker) in checks.items():
+              if rej in rejects:
+                  text = Path(src).read_text(errors='ignore')
+                  if marker not in text.lower():
+                      print(f'{src}: known reject still needs manual adaptation', file=sys.stderr)
+                      sys.exit(3)
+
+          for p in rejects:
+              p.unlink(missing_ok=True)
           PYFIX
-
-            rm -f fs/namei.c.rej fs/notify/fdinfo.c.rej fs/proc/cmdline.c.rej kernel/sys.c.rej
           fi
 
-          REMAINING="$(find . -name '*.rej' -print)"
-          if [ -n "$REMAINING" ]; then
-            echo "::error::Reject files remain after Xcalibur merge"
-            echo "$REMAINING"
+          if find . -name '*.rej' -print -quit | grep -q .; then
+            echo "Reject files remain" >&2
+            find . -name '*.rej' -print >&2
             exit 1
           fi
 
-          sed -i 's/^orig_flow:$/orig_flow:;/' fs/notify/fdinfo.c
-
           test -f fs/susfs.c
           test -f include/linux/susfs.h
-          grep -q 'susfs_spoof_cmdline_or_bootconfig(m)' fs/proc/cmdline.c
-          grep -q 'susfs_spoof_uname(&tmp)' kernel/sys.c
-          grep -q 'susfs_is_current_proc_umounted()' fs/notify/fdinfo.c
-          grep -q 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK' fs/namei.c
+          grep -R "SUSFS_VERSION" -n include/linux/susfs.h | head -n 2 | tee ../diagnostics/susfs-version.txt
 
-          SUSFS_VERSION_LINE="$(grep -E '^#define[[:space:]]+SUSFS_VERSION' include/linux/susfs.h | head -n1 || true)"
-          echo "$SUSFS_VERSION_LINE" | tee ../diagnostics/susfs-version.txt
-          git diff -- fs/namei.c fs/notify/fdinfo.c fs/proc/cmdline.c kernel/sys.c > ../diagnostics/xcalibur-susfs-merge.diff
-
-      - name: Configure Sep-11 KernelSU-with-susfs
+      - name: Configure BakaSU + SUSFS
+        shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           cd kernel
-          DEFCONFIG="arch/arm64/configs/${DEFCONFIG_NAME}"
-          test -f "$DEFCONFIG"
+          DEF="arch/arm64/configs/$DEFCONFIG"
+          test -f "$DEF"
 
           set_y() {
-            key="$1"
-            sed -i -e "/^${key}=/d" -e "/^# ${key} is not set/d" "$DEFCONFIG"
-            echo "${key}=y" >> "$DEFCONFIG"
+            local k="$1"
+            sed -i -e "/^${k}=/d" -e "/^# ${k} is not set/d" "$DEF"
+            echo "${k}=y" >> "$DEF"
           }
           set_n() {
-            key="$1"
-            sed -i -e "/^${key}=/d" -e "/^# ${key} is not set/d" "$DEFCONFIG"
-            echo "# ${key} is not set" >> "$DEFCONFIG"
+            local k="$1"
+            sed -i -e "/^${k}=/d" -e "/^# ${k} is not set/d" "$DEF"
+            echo "# ${k} is not set" >> "$DEF"
           }
-          ksu_symbol_exists() {
-            local sym="${1#CONFIG_}"
-            grep -RqsE "^[[:space:]]*(menu)?config[[:space:]]+${sym}([[:space:]]|$)" KernelSU/kernel
-          }
-          set_y_if_exists() { if ksu_symbol_exists "$1"; then set_y "$1"; fi; }
-          set_n_if_exists() { if ksu_symbol_exists "$1"; then set_n "$1"; fi; }
 
-          # Match the maintainer's Sep-11 "KernelSU-with-susfs" workflow.
           set_y CONFIG_KSU
+          set_y CONFIG_KSU_SUSFS
+          set_n CONFIG_KSU_MANUAL_HOOK
+          set_n CONFIG_KSU_TRACEPOINT_HOOK
           set_y CONFIG_KPROBES
           set_y CONFIG_KPROBE_EVENTS
-          set_y CONFIG_KSU_KPROBE_HOOKS
+          set_y CONFIG_KRETPROBES
           set_y CONFIG_OVERLAY_FS
-          set_y CONFIG_KSU_SUSFS
 
-          # Do not force the later Sep-24 syscall-table option here.
-          set_n_if_exists CONFIG_KSU_TAMPER_SYSCALL_TABLE
+          for k in \
+            CONFIG_KSU_SUSFS_SUS_PATH \
+            CONFIG_KSU_SUSFS_SUS_MOUNT \
+            CONFIG_KSU_SUSFS_SUS_KSTAT \
+            CONFIG_KSU_SUSFS_SPOOF_UNAME \
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+            CONFIG_KSU_SUSFS_SUS_MAP; do
+            set_y "$k"
+          done
+          set_n CONFIG_KSU_SUSFS_ENABLE_LOG
 
-          # Enable hiding features only when that historical KSU patch exposes them.
-          set_y_if_exists CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
-          set_y_if_exists CONFIG_KSU_SUSFS_SUS_PATH
-          set_y_if_exists CONFIG_KSU_SUSFS_SUS_MOUNT
-          set_y_if_exists CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-          set_y_if_exists CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-          set_y_if_exists CONFIG_KSU_SUSFS_SUS_KSTAT
-          set_y_if_exists CONFIG_KSU_SUSFS_TRY_UMOUNT
-          set_y_if_exists CONFIG_KSU_SUSFS_SPOOF_UNAME
-          set_y_if_exists CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-          set_y_if_exists CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          set_y_if_exists CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          set_y_if_exists CONFIG_KSU_SUSFS_SUS_MAP
-          set_n_if_exists CONFIG_KSU_SUSFS_ENABLE_LOG
-          set_n_if_exists CONFIG_KSU_SUSFS_SUS_SU
-
-          tail -n 100 "$DEFCONFIG" > ../diagnostics/defconfig-tail.txt
-
-      - name: Compile kernel
+      - name: Build kernel
+        shell: bash
         run: |
-          set -euo pipefail
-          CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/${CLANG_VERSION}/bin"
-          export PATH="/usr/lib/ccache:${CLANG_ROOT}:$PATH"
-          export CC="ccache ${CLANG_ROOT}/clang"
-          export CXX="ccache ${CLANG_ROOT}/clang++"
-          export HOSTCC="ccache ${CLANG_ROOT}/clang"
-          export HOSTCXX="ccache ${CLANG_ROOT}/clang++"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export LD="${CLANG_ROOT}/ld.lld"
-          export AR="${CLANG_ROOT}/llvm-ar"
-          export NM="${CLANG_ROOT}/llvm-nm"
-          export OBJCOPY="${CLANG_ROOT}/llvm-objcopy"
-          export OBJDUMP="${CLANG_ROOT}/llvm-objdump"
-          export STRIP="${CLANG_ROOT}/llvm-strip"
+          set -euxo pipefail
+          CLANG_ROOT="$GITHUB_WORKSPACE/toolchains/$CLANG_VERSION/bin"
+          export PATH="/usr/lib/ccache:$CLANG_ROOT:$PATH"
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export CC="ccache $CLANG_ROOT/clang"
+          export CXX="ccache $CLANG_ROOT/clang++"
+          export HOSTCC="ccache $CLANG_ROOT/clang"
+          export HOSTCXX="ccache $CLANG_ROOT/clang++"
+          export LD="$CLANG_ROOT/ld.lld"
+          export AR="$CLANG_ROOT/llvm-ar"
+          export NM="$CLANG_ROOT/llvm-nm"
+          export OBJCOPY="$CLANG_ROOT/llvm-objcopy"
+          export OBJDUMP="$CLANG_ROOT/llvm-objdump"
+          export STRIP="$CLANG_ROOT/llvm-strip"
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
           cd kernel
           mkdir -p out
-          touch ./.scmversion
-          make O=out "${DEFCONFIG_NAME}" CLANG_TRIPLE=aarch64-linux-gnu-
+          touch .scmversion
+          make O=out "$DEFCONFIG" CLANG_TRIPLE=aarch64-linux-gnu-
           make O=out olddefconfig CLANG_TRIPLE=aarch64-linux-gnu-
-          cp out/.config ../diagnostics/final.config
 
-          echo "===== Final KSU / SUSFS config ====="
-          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_KPROBE_HOOKS|CONFIG_KSU_TAMPER_SYSCALL_TABLE|CONFIG_KPROBES|CONFIG_OVERLAY_FS)' out/.config || true
-          echo "===================================="
+          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KPROBES|CONFIG_OVERLAY_FS)' out/.config \
+            | tee "$GITHUB_WORKSPACE/diagnostics/final-config.txt"
 
-          for key in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBE_HOOKS CONFIG_OVERLAY_FS CONFIG_KSU_SUSFS; do
-            grep -q "^${key}=y$" out/.config || { echo "::error::${key}=y missing"; exit 1; }
-          done
-
-          set +e
-          make -j"$(nproc)" O=out CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
-          status=${PIPESTATUS[0]}
-          set -e
-          if [ "$status" -ne 0 ]; then
-            echo "::error::Kernel compilation failed"
-            exit "$status"
+          grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_KSU_SUSFS=y$' out/.config
+          if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config || grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' out/.config; then
+            echo "Wrong KSU hook mode survived config" >&2
+            exit 1
           fi
 
-      - name: Verify built image contains KernelSU and SUSFS
-        run: |
-          set -euo pipefail
-          BOOT_DIR="kernel/out/arch/arm64/boot"
-          test -s "${BOOT_DIR}/Image.gz"
-          gzip -dc "${BOOT_DIR}/Image.gz" > built-Image
-          {
-            echo "===== kernel banner ====="
-            strings built-Image | grep -m1 'Linux version' || true
-            echo "===== SUSFS markers ====="
-            strings built-Image | grep -Ei -m30 'susfs is initialized|susfs_show_version|susfs_add_sus_path|susfs_add_sus_map|SUSFS_VERSION' || true
-            echo "===== KernelSU markers ====="
-            strings built-Image | grep -Ei -m30 'KernelSU:|selinux_hide|KSU ioctl' || true
-          } | tee diagnostics/built-image-markers.txt
+          set +e
+          make -j"$(nproc)" O=out CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/build.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          exit "$RC"
 
-          strings built-Image | grep -q 'susfs' || { echo "::error::No SUSFS marker in built image"; exit 1; }
-          strings built-Image | grep -q 'KernelSU:' || { echo "::error::No KernelSU marker in built image"; exit 1; }
-
-      - name: Package with proven Sep-30 DTB DTBO and installer
+      - name: Verify SUSFS in compiled image
+        shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          IMG=kernel/out/arch/arm64/boot/Image.gz
+          test -s "$IMG"
+          gzip -dc "$IMG" > built-Image
+          strings built-Image | grep -m1 'Linux version' | tee diagnostics/kernel-banner.txt || true
+          strings built-Image | grep -Ei -m20 'susfs is initialized|susfs_show_version|susfs_add_sus_path|susfs_add_sus_map' \
+            | tee diagnostics/susfs-markers.txt
+          grep -q 'susfs is initialized' diagnostics/susfs-markers.txt
+
+      - name: Package with known-good Sep-30 Xcalibur payload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -d known-good-sep30
           rm -rf package
           cp -a known-good-sep30 package
           cp kernel/out/arch/arm64/boot/Image.gz package/Image.gz
 
-          echo '5c48d4b4d2112c9af8a2f9b543996bb410eb6ddc6a2fd65c02101a46b8e68569  package/dtb' | sha256sum -c -
-          echo '1cb8c6023fee3a1a75624129bff66552e165e2328903a8fbefe68306253d77ad  package/dtbo.img' | sha256sum -c -
+          ZIP="Xcalibur-violet-BakaSU-${{ matrix.bakasu_ref }}-SUSFS-$(date +%Y%m%d-%H%M).zip"
+          (cd package && zip -r9 "../$ZIP" .)
+          sha256sum "$ZIP" > "$ZIP.sha256"
+          cp kernel/out/.config "$ZIP.config"
+          cp diagnostics/summary.txt "$ZIP.provenance.txt"
+          {
+            echo "kernel_sha=$KERNEL_SHA"
+            echo "bakasu_ref=${{ matrix.bakasu_ref }}"
+            echo "susfs_patch_commit=$SUSFS_PATCH_COMMIT"
+            echo "compiler=$CLANG_VERSION"
+          } >> "$ZIP.provenance.txt"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
-          SUSFS_VER="$(sed -n 's/.*SUSFS_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' diagnostics/susfs-version.txt | head -n1)"
-          [ -n "$SUSFS_VER" ] || SUSFS_VER="unknown"
-          ZIP_NAME="${KERNEL_NAME}_${SUSFS_VER}_$(date +'%Y%m%d_%H%M')"
-          (cd package && zip -r9 "../${ZIP_NAME}.zip" .)
-          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
-          sha256sum "${ZIP_NAME}.zip" | tee "${ZIP_NAME}.sha256"
-          cp kernel/out/.config "${ZIP_NAME}.config"
-
-          printf '%s\n' \
-            "kernel_source=${KERNEL_SOURCE}" \
-            "kernel_ref=${KERNEL_BRANCH}" \
-            "kernel_source_sha=${KERNEL_SOURCE_SHA}" \
-            "ksu_repo=${KSU_SOURCE}" \
-            "ksu_sha=${KSU_SHA}" \
-            "susfs_patch_repo=${SUSFS_PATCH_SOURCE}" \
-            "susfs_patch_sha=${SUSFS_PATCH_SHA}" \
-            "compiler=${CLANG_VERSION}" \
-            "known_good_sep30_package_sha256=858e34f51bbef6ae9ae5e9fbdc1571b91845eca0cd2ad1800a7bad281d33b569" \
-            > "${ZIP_NAME}.provenance.txt"
-
-      - name: Upload flashable kernel
+      - name: Upload successful candidate
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: xcalibur-violet-sep11-kernelsu-susfs
+          name: success-${{ matrix.bakasu_ref }}
           path: |
-            ${{ env.ZIP_NAME }}.zip
-            ${{ env.ZIP_NAME }}.sha256
-            ${{ env.ZIP_NAME }}.config
-            ${{ env.ZIP_NAME }}.provenance.txt
-            diagnostics/built-image-markers.txt
-            diagnostics/susfs-version.txt
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+            ${{ env.ZIP }}.config
+            ${{ env.ZIP }}.provenance.txt
+            diagnostics/**
 
-      - name: Collect diagnostics on failure
-        if: failure()
-        run: |
-          mkdir -p diagnostics
-          cp susfs-historical-apply.log diagnostics/ 2>/dev/null || true
-          cp susfs-historical-4.14.patch diagnostics/ 2>/dev/null || true
-          cp build.log diagnostics/ 2>/dev/null || true
-          find kernel -name '*.rej' -exec cp --parents '{}' diagnostics/ \; 2>/dev/null || true
-          find kernel -name '*.orig' -exec cp --parents '{}' diagnostics/ \; 2>/dev/null || true
-          find diagnostics -maxdepth 6 -type f -printf '%p\n' | sort
-
-      - name: Upload diagnostics on failure
-        if: failure()
+      - name: Upload diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcalibur-susfs-failure-logs
-          path: diagnostics/
-          if-no-files-found: error
+          name: diagnostics-${{ matrix.bakasu_ref }}
+          path: |
+            diagnostics/**
+            kernel/**/*.rej
+            kernel/**/*.orig
+            susfs-4.14.patch
+          if-no-files-found: warn
