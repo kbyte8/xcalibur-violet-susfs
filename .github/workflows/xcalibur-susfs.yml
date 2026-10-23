@@ -87,12 +87,18 @@ jobs:
           curl -fL --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o ../susfs-inline-hooks.sh
           chmod +x ../susfs-inline-hooks.sh
 
-          echo "Testing main 4.14 SUSFS patch..."
-          if ! patch --dry-run -p1 < ../susfs-4.14.patch; then
+          echo "Applying main 4.14 SUSFS patch and capturing rejects..."
+          set +e
+          patch -p1 --forward --batch < ../susfs-4.14.patch 2>&1 | tee ../susfs-main-patch.log
+          PATCH_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PATCH_RC" -ne 0 ]; then
             echo "::error::SUSFS 4.14 patch does not apply cleanly to this Xcalibur source."
+            echo "===== Reject files ====="
+            find . -name '*.rej' -print -exec sh -c 'echo "--- $1 ---"; cat "$1"' _ {} \; || true
             exit 1
           fi
-          patch -p1 < ../susfs-4.14.patch
 
           echo "Applying legacy/non-GKI inline hooks..."
           bash ../susfs-inline-hooks.sh | tee ../susfs-inline-hooks.log
@@ -295,7 +301,10 @@ jobs:
         with:
           name: xcalibur-susfs-failure-logs
           path: |
-            build.log
+            susfs-main-patch.log
+            susfs-4.14.patch
             susfs-inline-hooks.log
+            build.log
             kernel/**/*.rej
-          if-no-files-found: ignore
+            kernel/**/*.orig
+          if-no-files-found: warn
