@@ -1,4 +1,4 @@
-name: Xcalibur Violet - Historical KernelSU + SUSFS 4.14
+name: Xcalibur Violet - Sep11 KernelSU + SUSFS 4.14
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ env:
   KERNEL_BRANCH: "17"
   KERNEL_BUILD_TIME: "2026-09-30T01:25:49+01:00"
   KSU_SOURCE: "https://github.com/Justadeayo/KernelSU"
-  KSU_BUILD_TIME: "2026-09-30T01:25:49+01:00"
+  KSU_REF: "6005b0cba6d33fa3e43a4112ce872e66420c6163"
   SUSFS_PATCH_SOURCE: "https://github.com/sanba0519/Kernel-patch"
   SUSFS_PATCH_TIME: "2026-09-11T09:36:41+01:00"
   DEFCONFIG_NAME: "vendor/violet-perf_defconfig"
@@ -33,12 +33,12 @@ jobs:
         run: |
           mkdir -p diagnostics
           {
-            echo "workflow=v7-historical-kernelsu-susfs"
+            echo "workflow=v8-sep11-kernelsu-susfs"
             echo "kernel_source=${KERNEL_SOURCE}"
             echo "kernel_branch=${KERNEL_BRANCH}"
             echo "kernel_before=${KERNEL_BUILD_TIME}"
             echo "ksu_source=${KSU_SOURCE}"
-            echo "ksu_before=${KSU_BUILD_TIME}"
+            echo "ksu_ref=${KSU_REF}"
             echo "susfs_patch_source=${SUSFS_PATCH_SOURCE}"
             echo "susfs_patch_before=${SUSFS_PATCH_TIME}"
           } > diagnostics/build-plan.txt
@@ -51,7 +51,7 @@ jobs:
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: xcalibur-violet-historical-ksu-susfs-v7
+          key: xcalibur-violet-sep11-ksu-susfs-v8
           max-size: 5G
 
       - name: Install build dependencies
@@ -95,18 +95,14 @@ jobs:
           test -x "toolchains/${CLANG_VERSION}/bin/clang"
           "toolchains/${CLANG_VERSION}/bin/clang" --version | head -n1 | tee diagnostics/clang.txt
 
-      - name: Integrate Sep-30-era Justadeayo KernelSU
+      - name: Integrate Sep-11-era Justadeayo KernelSU
         run: |
           set -euo pipefail
           cd kernel
           rm -rf KernelSU drivers/kernelsu
           git clone --filter=blob:none "${KSU_SOURCE}" KernelSU
-          KSU_SHA="$(git -C KernelSU rev-list -1 --before="${KSU_BUILD_TIME}" origin/master)"
-          if [ -z "$KSU_SHA" ]; then
-            echo "::error::Could not resolve historical KernelSU commit"
-            exit 1
-          fi
-          git -C KernelSU checkout --detach "$KSU_SHA"
+          git -C KernelSU checkout --detach "${KSU_REF}"
+          KSU_SHA="$(git -C KernelSU rev-parse HEAD)"
           echo "KSU_SHA=$KSU_SHA" >> "$GITHUB_ENV"
 
           ln -s ../KernelSU/kernel drivers/kernelsu
@@ -120,11 +116,16 @@ jobs:
           {
             echo "ksu_sha=$KSU_SHA"
             echo "ksu_commit=$(git -C KernelSU show -s --format='%cI | %s' "$KSU_SHA")"
-            echo "===== KernelSU Makefile version lines ====="
+            echo "===== KernelSU version lines ====="
             grep -nE 'KSU_VERSION|VERSION_TAG' KernelSU/kernel/Makefile KernelSU/Makefile 2>/dev/null || true
-            echo "===== Existing SUSFS Kconfig before historical patch ====="
+            echo "===== SUSFS Kconfig in Sep-11-era KernelSU ====="
             grep -Rns 'config KSU_SUSFS' KernelSU/kernel 2>/dev/null || true
-          } | tee ../diagnostics/kernelsu-historical.txt
+          } | tee ../diagnostics/kernelsu-sep11.txt
+
+          if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KSU_SUSFS([[:space:]]|$)' KernelSU/kernel; then
+            echo "::error::Sep-11-era Justadeayo KernelSU does not expose CONFIG_KSU_SUSFS"
+            exit 1
+          fi
 
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile -o -f drivers/kernelsu/Kbuild
@@ -160,7 +161,7 @@ jobs:
           } | tee diagnostics/historical-susfs-patch.txt
           sha256sum susfs-historical-4.14.patch > diagnostics/historical-susfs-patch.sha256
 
-      - name: Apply maintainer historical KernelSU SUSFS patch
+      - name: Apply historical SUSFS patch with Xcalibur merges
         run: |
           set -euo pipefail
           cd kernel
@@ -174,88 +175,194 @@ jobs:
 
           if [ "$PATCH_RC" -ne 0 ]; then
             mapfile -t rejects < <(find . -name '*.rej' -print | sort)
-            echo "Historical patch returned $PATCH_RC; rejects: ${rejects[*]:-none}"
+            printf 'Historical patch returned %s; rejects:\n' "$PATCH_RC"
+            printf '  %s\n' "${rejects[@]}"
 
-            # The Xcalibur branch can differ in these two proc files. Only auto-fix
-            # the same two layout conflicts we already observed in previous runs.
-            if [ "${#rejects[@]}" -eq 2 ] && \
-               [ "${rejects[0]}" = './fs/proc/cmdline.c.rej' ] && \
-               [ "${rejects[1]}" = './fs/proc/task_mmu.c.rej' ]; then
-              python3 - <<'PYFIX'
+            expected=(
+              './fs/namei.c.rej'
+              './fs/notify/fdinfo.c.rej'
+              './fs/proc/cmdline.c.rej'
+              './kernel/sys.c.rej'
+            )
+            if [ "${#rejects[@]}" -ne "${#expected[@]}" ]; then
+              echo "::error::Unexpected number of historical patch rejects"
+              exit 1
+            fi
+            for i in "${!expected[@]}"; do
+              if [ "${rejects[$i]}" != "${expected[$i]}" ]; then
+                echo "::error::Unexpected reject: ${rejects[$i]} (expected ${expected[$i]})"
+                exit 1
+              fi
+            done
+
+            echo "Applying four Xcalibur-specific compatibility merges..."
+            python3 - <<'PYFIX'
           from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f'{label}: anchor not found')
+              return text.replace(old, new, 1)
 
           p = Path('fs/proc/cmdline.c')
           s = p.read_text()
-          decls = '''
-          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
-          extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
-          #endif
-          '''
           if 'susfs_is_fake_cmdline_or_bootconfig_buffer_set' not in s:
               anchor = '#include <asm/setup.h>\n'
-              if anchor not in s:
-                  raise SystemExit('cmdline.c include anchor missing')
-              s = s.replace(anchor, anchor + decls, 1)
-          spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          \tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
-          \t\tsusfs_spoof_cmdline_or_bootconfig(m);
-          \t\tseq_putc(m, '\\n');
-          \t\treturn 0;
-          \t}
-          #endif
-          '''
-          fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
+              decls = '#include <asm/setup.h>\n\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;\nextern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif\n'
+              s = replace_once(s, anchor, decls, 'cmdline declarations')
           if 'susfs_spoof_cmdline_or_bootconfig(m);' not in s:
-              if fn not in s:
-                  raise SystemExit('cmdline_proc_show anchor missing')
-              s = s.replace(fn, fn + spoof, 1)
+              fn = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n'
+              spoof = 'static int cmdline_proc_show(struct seq_file *m, void *v)\n{\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {\n\t\tsusfs_spoof_cmdline_or_bootconfig(m);\n\t\tseq_putc(m, \'\\n\');\n\t\treturn 0;\n\t}\n#endif\n'
+              s = replace_once(s, fn, spoof, 'cmdline show')
           p.write_text(s)
 
-          p = Path('fs/proc/task_mmu.c')
+          p = Path('kernel/sys.c')
           s = p.read_text()
-          inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
-          #include <linux/susfs_def.h>
+          newuname_start = s.index('SYSCALL_DEFINE1(newuname')
+          olduname_start = s.index('#ifdef __ARCH_WANT_SYS_OLD_UNAME', newuname_start)
+          part = s[newuname_start:olduname_start]
+          if 'susfs_spoof_uname(&tmp);' not in part:
+              anchor = '\tmemcpy(&tmp, utsname(), sizeof(tmp));\n'
+              inject = '\tmemcpy(&tmp, utsname(), sizeof(tmp));\n#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tif (static_branch_likely(&susfs_is_uname_spoof_buffer_set))\n\t\tsusfs_spoof_uname(&tmp);\n#endif\n'
+              part = replace_once(part, anchor, inject, 'newuname')
+              s = s[:newuname_start] + part + s[olduname_start:]
+          p.write_text(s)
+
+          p = Path('fs/notify/fdinfo.c')
+          s = p.read_text()
+          fn_start = s.index('static void inotify_fdinfo')
+          fn_end = s.index('void inotify_show_fdinfo', fn_start)
+          part = s[fn_start:fn_end]
+          if 'susfs_is_current_proc_umounted()' not in part:
+              anchor = '\tif (inode) {\n'
+              block = '''\tif (inode) {
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t\tmnt = real_mount(file->f_path.mnt);
+          \t\tif (mnt->mnt_id >= DEFAULT_KSU_MNT_ID &&
+          \t\t\tlikely(susfs_is_current_proc_umounted())) {
+          \t\t\tstruct path path;
+          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+          \t\t\tchar *dpath;
+          \t\t\tif (!pathname)
+          \t\t\t\tgoto orig_flow;
+          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+          \t\t\tif (!dpath)
+          \t\t\t\tgoto out_kfree;
+          \t\t\tif (kern_path(dpath, 0, &path))
+          \t\t\t\tgoto out_kfree;
+          \t\t\tif (!path.dentry->d_inode)
+          \t\t\t\tgoto out_path_put;
+          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
+          \t\t\t\tinode_mark->wd, path.dentry->d_inode->i_ino,
+          \t\t\t\tpath.dentry->d_inode->i_sb->s_dev, mark->mask & IN_ALL_EVENTS);
+          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
+          \t\t\tseq_putc(m, '\\n');
+          \t\t\tpath_put(&path);
+          \t\t\tkfree(pathname);
+          \t\t\tiput(inode);
+          \t\t\treturn;
+          out_path_put:
+          \t\t\tpath_put(&path);
+          out_kfree:
+          \t\t\tkfree(pathname);
+          orig_flow:;
+          \t\t}
           #endif
           '''
-          if '#include <linux/susfs_def.h>' not in s:
-              anchor = '#include <linux/ctype.h>\n'
-              if anchor not in s:
-                  raise SystemExit('task_mmu.c include anchor missing')
-              s = s.replace(anchor, anchor + inc, 1)
+              part = replace_once(part, anchor, block, 'fdinfo inotify body')
+              s = s[:fn_start] + part + s[fn_end:]
+          p.write_text(s)
+
+          p = Path('fs/namei.c')
+          s = p.read_text()
+          tmp_start = s.index('static int do_tmpfile(')
+          opath_start = s.index('static int do_o_path(', tmp_start)
+          tmp = s[tmp_start:opath_start]
+          cleanup_anchor = '\tout:\n\tpath_put(&path);\n\treturn error;\n}\n\n'
+          if cleanup_anchor in tmp:
+              repl = '\tout:\n\tpath_put(&path);\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tif (fake_filename && !IS_ERR(fake_filename))\n\t\tputname(fake_filename);\n#endif\n\treturn error;\n}\n\n'
+              tmp = tmp.replace(cleanup_anchor, repl, 1)
+              s = s[:tmp_start] + tmp + s[opath_start:]
+
+          opath_start = s.index('static int do_o_path(')
+          pathopen_start = s.index('static struct file *path_openat(', opath_start)
+          opath = s[opath_start:pathopen_start]
+          if 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK' not in opath:
+              old = 'static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)\n{\n\tstruct path path;\n\tint error = path_lookupat(nd, flags, &path);\n\tif (!error) {\n\t\taudit_inode(nd->name, path.dentry, 0);\n\t\terror = vfs_open(&path, file);\n\t\tpath_put(&path);\n\t}\n\treturn error;\n}\n\n'
+              new = '''static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+          {
+          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          \tint old_dfd = nd->dfd;
+          \tstruct filename *fake_filename = NULL;
+          #endif
+          \tstruct path path;
+          \tint error = path_lookupat(nd, flags, &path);
+          \tif (!error) {
+          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          \t\tif (old_dfd != -1 &&
+          \t\t\tSUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(path.dentry->d_inode)) {
+          \t\t\tfake_filename = susfs_open_redirect_spoof_do_sys_openat(path.dentry->d_inode);
+          \t\t\tif (fake_filename && !IS_ERR(fake_filename)) {
+          \t\t\t\tpath_put(&path);
+          \t\t\t\trestore_nameidata();
+          \t\t\t\tset_nameidata(nd, old_dfd, fake_filename);
+          \t\t\t\terror = path_lookupat(nd, flags, &path);
+          \t\t\t\tif (unlikely(error)) {
+          \t\t\t\t\tputname(fake_filename);
+          \t\t\t\t\treturn error;
+          \t\t\t\t}
+          \t\t\t}
+          \t\t}
+          #endif
+          \t\taudit_inode(nd->name, path.dentry, 0);
+          \t\terror = vfs_open(&path, file);
+          \t\tpath_put(&path);
+          \t}
+          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          \tif (fake_filename && !IS_ERR(fake_filename))
+          \t\tputname(fake_filename);
+          #endif
+          \treturn error;
+          }
+
+          '''
+              if old not in opath:
+                  raise SystemExit('do_o_path: expected Xcalibur body not found')
+              opath = opath.replace(old, new, 1)
+              s = s[:opath_start] + opath + s[pathopen_start:]
+
+          pathopen_start = s.index('static struct file *path_openat(')
+          if 'int old_dfd = nd->dfd;' not in s[pathopen_start:pathopen_start+500]:
+              anchor = 'static struct file *path_openat(struct nameidata *nd,\n\t\t\tconst struct open_flags *op, unsigned flags)\n{\n'
+              repl = 'static struct file *path_openat(struct nameidata *nd,\n\t\t\tconst struct open_flags *op, unsigned flags)\n{\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tint old_dfd = nd->dfd;\n\tstruct filename *fake_filename = NULL;\n#endif\n'
+              s = replace_once(s, anchor, repl, 'path_openat declarations')
           p.write_text(s)
           PYFIX
-              rm -f fs/proc/cmdline.c.rej fs/proc/task_mmu.c.rej
-            else
-              echo "::error::Historical maintainer patch has unexpected rejects"
-              exit 1
-            fi
+
+            rm -f fs/namei.c.rej fs/notify/fdinfo.c.rej fs/proc/cmdline.c.rej kernel/sys.c.rej
           fi
 
           REMAINING="$(find . -name '*.rej' -print)"
           if [ -n "$REMAINING" ]; then
-            echo "::error::Reject files remain after historical patch"
+            echo "::error::Reject files remain after Xcalibur merge"
             echo "$REMAINING"
             exit 1
           fi
 
-          if ! grep -Rqs 'config KSU_SUSFS' KernelSU/kernel drivers/kernelsu; then
-            echo "::error::Historical patch did not add CONFIG_KSU_SUSFS to this KernelSU tree"
-            exit 1
-          fi
+          sed -i 's/^orig_flow:$/orig_flow:;/' fs/notify/fdinfo.c
+
           test -f fs/susfs.c
           test -f include/linux/susfs.h
+          grep -q 'susfs_spoof_cmdline_or_bootconfig(m)' fs/proc/cmdline.c
+          grep -q 'susfs_spoof_uname(&tmp)' kernel/sys.c
+          grep -q 'susfs_is_current_proc_umounted()' fs/notify/fdinfo.c
+          grep -q 'SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK' fs/namei.c
+
           SUSFS_VERSION_LINE="$(grep -E '^#define[[:space:]]+SUSFS_VERSION' include/linux/susfs.h | head -n1 || true)"
           echo "$SUSFS_VERSION_LINE" | tee ../diagnostics/susfs-version.txt
+          git diff -- fs/namei.c fs/notify/fdinfo.c fs/proc/cmdline.c kernel/sys.c > ../diagnostics/xcalibur-susfs-merge.diff
 
-          {
-            echo "===== SUSFS Kconfig after historical patch ====="
-            grep -Rns 'KSU_SUSFS' KernelSU/kernel/Kconfig drivers/kernelsu/Kconfig 2>/dev/null || true
-            echo "===== KernelSU hook symbols after patch ====="
-            grep -RhoE 'ksu_handle_[A-Za-z0-9_]+' KernelSU/kernel 2>/dev/null | sort -u || true
-          } > ../diagnostics/kernelsu-after-historical-susfs.txt
-
-      - name: Configure same Sep-30 hooks plus SUSFS
+      - name: Configure Sep-11 KernelSU-with-susfs
         run: |
           set -euo pipefail
           cd kernel
@@ -279,16 +386,16 @@ jobs:
           set_y_if_exists() { if ksu_symbol_exists "$1"; then set_y "$1"; fi; }
           set_n_if_exists() { if ksu_symbol_exists "$1"; then set_n "$1"; fi; }
 
-          # Exact settings appended by the known-good Sep-30 v3.3.0-18 builder.
+          # Match the maintainer's Sep-11 "KernelSU-with-susfs" workflow.
           set_y CONFIG_KSU
           set_y CONFIG_KPROBES
           set_y CONFIG_KPROBE_EVENTS
           set_y CONFIG_KSU_KPROBE_HOOKS
           set_y CONFIG_OVERLAY_FS
-          set_y CONFIG_KSU_TAMPER_SYSCALL_TABLE
-
-          # Historical maintainer workflow added this one base SUSFS flag.
           set_y CONFIG_KSU_SUSFS
+
+          # Do not force the later Sep-24 syscall-table option here.
+          set_n_if_exists CONFIG_KSU_TAMPER_SYSCALL_TABLE
 
           # Enable hiding features only when that historical KSU patch exposes them.
           set_y_if_exists CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
@@ -341,7 +448,7 @@ jobs:
           grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_KPROBE_HOOKS|CONFIG_KSU_TAMPER_SYSCALL_TABLE|CONFIG_KPROBES|CONFIG_OVERLAY_FS)' out/.config || true
           echo "===================================="
 
-          for key in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBE_HOOKS CONFIG_OVERLAY_FS CONFIG_KSU_TAMPER_SYSCALL_TABLE CONFIG_KSU_SUSFS; do
+          for key in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBE_HOOKS CONFIG_OVERLAY_FS CONFIG_KSU_SUSFS; do
             grep -q "^${key}=y$" out/.config || { echo "::error::${key}=y missing"; exit 1; }
           done
 
@@ -405,7 +512,7 @@ jobs:
       - name: Upload flashable kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcalibur-violet-historical-kernelsu-susfs
+          name: xcalibur-violet-sep11-kernelsu-susfs
           path: |
             ${{ env.ZIP_NAME }}.zip
             ${{ env.ZIP_NAME }}.sha256
