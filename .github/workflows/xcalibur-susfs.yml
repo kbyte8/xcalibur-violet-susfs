@@ -1,4 +1,4 @@
-name: Xcalibur Violet - ReSukiSU + SUSFS 2.3
+name: Xcalibur Violet - KernelSU + SUSFS 2.3
 
 on:
   workflow_dispatch:
@@ -10,9 +10,10 @@ env:
   KERNEL_BRANCH: "17"
   DEFCONFIG_NAME: "vendor/violet-perf_defconfig"
   DEVICE_CODENAME: "violet"
-  KERNEL_NAME: "Xcalibur-violet-ReSukiSU-SUSFS"
+  KERNEL_NAME: "Xcalibur-violet-KernelSU-SUSFS"
+  KSU_REF: "master"
   SUSFS_PATCH_COMMIT: "e2f895b"
-  RESUKISU_BRANCH: "master"
+  SUSFS_UPSTREAM_BRANCH: "gki-android14-6.1"
 
 jobs:
   build:
@@ -22,8 +23,20 @@ jobs:
       actions: read
 
     steps:
-      - name: Checkout modified builder
+      - name: Checkout builder
         uses: actions/checkout@v4
+
+      - name: Initialize diagnostics
+        run: |
+          mkdir -p diagnostics
+          {
+            echo "workflow=v6-kernelsu-susfs"
+            echo "kernel_source=${KERNEL_SOURCE}"
+            echo "kernel_branch=${KERNEL_BRANCH}"
+            echo "ksu_repo=https://github.com/Justadeayo/KernelSU"
+            echo "ksu_ref=${KSU_REF}"
+            echo "susfs_kernel_patch_commit=${SUSFS_PATCH_COMMIT}"
+          } > diagnostics/build-plan.txt
 
       - name: Setup swap
         uses: pierotofy/set-swap-space@master
@@ -33,7 +46,7 @@ jobs:
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: xcalibur-violet-susfs
+          key: xcalibur-violet-kernelsu-susfs-v6
           max-size: 5G
 
       - name: Install build dependencies
@@ -45,117 +58,151 @@ jobs:
             lz4 git python3 curl dwarves cpio lld gcc-aarch64-linux-gnu \
             gcc-arm-linux-gnueabi zip patch
 
-      - name: Clone exact Xcalibur source family
+      - name: Clone Xcalibur source
         run: |
+          set -euo pipefail
           rm -rf kernel
           git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_SOURCE}" kernel
           cd kernel
-          echo "KERNEL_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "Kernel source: $(git rev-parse HEAD)"
-          echo "Kernel version: $(make kernelversion)"
+          KERNEL_SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "KERNEL_SOURCE_SHA=${KERNEL_SOURCE_SHA}" >> "$GITHUB_ENV"
+          {
+            echo "kernel_source_sha=${KERNEL_SOURCE_SHA}"
+            echo "kernel_version=$(make kernelversion)"
+          } >> ../diagnostics/build-plan.txt
+          make kernelversion
 
-      - name: Download same Clang family as Sep-30 build
+      - name: Download Sep-30 Clang family
         run: |
+          set -euo pipefail
           mkdir -p "toolchains/${CLANG_VERSION}"
           git clone --depth=1 \
             https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git \
             "toolchains/${CLANG_VERSION}"
           test -x "toolchains/${CLANG_VERSION}/bin/clang"
-          "toolchains/${CLANG_VERSION}/bin/clang" --version | head -n 1
+          "toolchains/${CLANG_VERSION}/bin/clang" --version | head -n 1 | tee diagnostics/clang.txt
 
-      - name: Integrate ReSukiSU
+      - name: Integrate the same Justadeayo KernelSU family
         run: |
           set -euo pipefail
-          mkdir -p diagnostics
           cd kernel
 
+          # This is intentionally the same setup path used by the user's
+          # known-working Sep-30 Xcalibur v3.3.0-18 builder.
           curl -fL --retry 3 \
-            "https://raw.githubusercontent.com/Justadeayo/sKernelSU/${RESUKISU_BRANCH}/kernel/setup.sh" \
+            "https://raw.githubusercontent.com/Justadeayo/KernelSU/refs/heads/${KSU_REF}/kernel/setup.sh" \
             -o setup.sh
+          sed -i 's|backslashxx/KernelSU|Justadeayo/KernelSU|g' setup.sh
+          bash setup.sh "${KSU_REF}" 2>&1 | tee ../kernelsu-setup.log
 
-          bash setup.sh "${RESUKISU_BRANCH}" 2>&1 | tee ../resukisu-setup.log
-
-          # setup.sh is authoritative: it creates drivers/kernelsu and wires
-          # drivers/Makefile + drivers/Kconfig. Do not assume the clone dir name.
           if [ ! -L drivers/kernelsu ]; then
-            echo "::error::ReSukiSU setup finished but drivers/kernelsu symlink is missing"
-            ls -la drivers | tee ../diagnostics/drivers-list.txt
+            echo "::error::KernelSU setup completed but drivers/kernelsu symlink is missing"
+            ls -la drivers > ../diagnostics/drivers-list.txt
             exit 1
           fi
 
           KSU_KERNEL_DIR="$(readlink -f drivers/kernelsu)"
-          if [ ! -d "$KSU_KERNEL_DIR" ]; then
-            echo "::error::drivers/kernelsu points to a missing directory: $KSU_KERNEL_DIR"
-            exit 1
-          fi
-
           KSU_REPO_DIR="$(git -C "$KSU_KERNEL_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-          if [ -z "$KSU_REPO_DIR" ]; then
-            echo "::error::Could not determine ReSukiSU repository root from $KSU_KERNEL_DIR"
+          if [ -z "$KSU_REPO_DIR" ] || [ ! -d "$KSU_REPO_DIR" ]; then
+            echo "::error::Could not resolve KernelSU repository from drivers/kernelsu"
             exit 1
           fi
 
-          RESUKISU_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
-          echo "RESUKISU_SHA=$RESUKISU_SHA" >> "$GITHUB_ENV"
-          echo "KSU kernel dir: $KSU_KERNEL_DIR"
-          echo "KSU repo dir:   $KSU_REPO_DIR"
-          echo "KSU SHA:        $RESUKISU_SHA"
+          KSU_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
+          KSU_VERSION="$(grep -E '^KSU_VERSION[[:space:]]*[:?+]?=' "$KSU_REPO_DIR/Makefile" 2>/dev/null | head -n1 | sed -E 's/.*=[[:space:]]*//' || true)"
+          echo "KSU_KERNEL_DIR=${KSU_KERNEL_DIR}" >> "$GITHUB_ENV"
+          echo "KSU_REPO_DIR=${KSU_REPO_DIR}" >> "$GITHUB_ENV"
+          echo "KSU_SHA=${KSU_SHA}" >> "$GITHUB_ENV"
+          echo "KSU_VERSION_DETECTED=${KSU_VERSION}" >> "$GITHUB_ENV"
 
-          test -f drivers/kernelsu/Kconfig
-          if [ ! -f drivers/kernelsu/Kbuild ] && [ ! -f drivers/kernelsu/Makefile ]; then
-            echo "::error::ReSukiSU kernel directory has neither Kbuild nor Makefile"
-            exit 1
-          fi
+          {
+            echo "ksu_repo_dir=${KSU_REPO_DIR}"
+            echo "ksu_kernel_dir=${KSU_KERNEL_DIR}"
+            echo "ksu_sha=${KSU_SHA}"
+            echo "ksu_version_detected=${KSU_VERSION}"
+            echo "===== drivers/Makefile ====="
+            grep -n 'kernelsu' drivers/Makefile || true
+            echo "===== drivers/Kconfig ====="
+            grep -n 'kernelsu' drivers/Kconfig || true
+            echo "===== current KSU hook symbols in source ====="
+            grep -RhoE 'ksu_handle_[A-Za-z0-9_]+' "$KSU_KERNEL_DIR" 2>/dev/null | sort -u || true
+          } > ../diagnostics/kernelsu-before-susfs.txt
 
           grep -qE 'obj-\$\(CONFIG_KSU\).*kernelsu/' drivers/Makefile || {
-            echo "::error::drivers/Makefile is not wired to drivers/kernelsu"
-            tail -n 40 drivers/Makefile
+            echo "::error::KernelSU is not wired into drivers/Makefile"
             exit 1
           }
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || {
-            echo "::error::drivers/Kconfig is not wired to drivers/kernelsu/Kconfig"
-            tail -n 60 drivers/Kconfig
+            echo "::error::KernelSU is not wired into drivers/Kconfig"
             exit 1
           }
 
-          if ! grep -q 'KSU_SUSFS' drivers/kernelsu/Kconfig; then
-            echo "::error::Selected ReSukiSU tree does not expose SUSFS Kconfig options"
+      - name: Fetch SUSFS 2.3 KernelSU-side integration
+        run: |
+          set -euo pipefail
+          rm -rf susfs-upstream
+          git clone --depth=1 -b "${SUSFS_UPSTREAM_BRANCH}" \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs-upstream
+
+          SUSFS_UPSTREAM_SHA="$(git -C susfs-upstream rev-parse HEAD)"
+          echo "SUSFS_UPSTREAM_SHA=${SUSFS_UPSTREAM_SHA}" >> "$GITHUB_ENV"
+          echo "susfs_upstream_sha=${SUSFS_UPSTREAM_SHA}" >> diagnostics/build-plan.txt
+
+          test -s susfs-upstream/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          cp susfs-upstream/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch \
+            ksu-enable-susfs.patch
+
+          # Newer SUSFS trees may ship a matching sucompat.h. Follow upstream's
+          # non-GKI instructions if it exists, but save the original first.
+          if [ -f susfs-upstream/kernel_patches/KernelSU/kernel/sucompat.h ]; then
+            cp "${KSU_KERNEL_DIR}/sucompat.h" diagnostics/ksu-sucompat-before.h 2>/dev/null || true
+            cp susfs-upstream/kernel_patches/KernelSU/kernel/sucompat.h \
+              "${KSU_KERNEL_DIR}/sucompat.h"
+          fi
+
+          set +e
+          (
+            cd "${KSU_REPO_DIR}"
+            patch -p1 --forward --batch < "${GITHUB_WORKSPACE}/ksu-enable-susfs.patch"
+          ) 2>&1 | tee ksu-susfs-patch.log
+          KSU_PATCH_RC=${PIPESTATUS[0]}
+          set -e
+
+          find "${KSU_REPO_DIR}" -name '*.rej' -print -exec sh -c \
+            'echo "===== $1 ====="; cat "$1"' _ {} \; > diagnostics/ksu-patch-rejects.txt || true
+
+          if [ "$KSU_PATCH_RC" -ne 0 ]; then
+            echo "::error::SUSFS KernelSU-side patch did not apply cleanly to Justadeayo/KernelSU"
+            exit 1
+          fi
+
+          if ! grep -q 'config KSU_SUSFS' "${KSU_KERNEL_DIR}/Kconfig"; then
+            echo "::error::KernelSU-side SUSFS patch applied but CONFIG_KSU_SUSFS is missing"
             exit 1
           fi
 
           {
-            echo "KSU_KERNEL_DIR=$KSU_KERNEL_DIR"
-            echo "KSU_REPO_DIR=$KSU_REPO_DIR"
-            echo "RESUKISU_SHA=$RESUKISU_SHA"
-            echo "===== drivers/Makefile KSU lines ====="
-            grep -n 'kernelsu' drivers/Makefile || true
-            echo "===== drivers/Kconfig KSU lines ====="
-            grep -n 'kernelsu' drivers/Kconfig || true
-            echo "===== KSU Kconfig SUSFS lines ====="
-            grep -n 'KSU_SUSFS' drivers/kernelsu/Kconfig | head -80 || true
-            echo "===== KSU build file ====="
-            if [ -f drivers/kernelsu/Kbuild ]; then
-              sed -n '1,220p' drivers/kernelsu/Kbuild
-            else
-              sed -n '1,220p' drivers/kernelsu/Makefile
-            fi
-          } > ../diagnostics/resukisu-integration.txt
+            echo "===== SUSFS Kconfig after patch ====="
+            grep -n 'KSU_SUSFS' "${KSU_KERNEL_DIR}/Kconfig" || true
+            echo "===== KSU hook symbols after SUSFS patch ====="
+            grep -RhoE 'ksu_handle_[A-Za-z0-9_]+' "${KSU_KERNEL_DIR}" 2>/dev/null | sort -u || true
+          } > diagnostics/kernelsu-after-susfs.txt
 
-      - name: Download and apply SUSFS 2.3 kernel patches
+      - name: Apply SUSFS 2.3 Linux 4.14 kernel patch
         run: |
-          set -e
+          set -euo pipefail
           cd kernel
           PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/${SUSFS_PATCH_COMMIT}/Patches"
-          curl -fL --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.14.patch" -o ../susfs-4.14.patch
-          curl -fL --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o ../susfs-inline-hooks.sh
-          chmod +x ../susfs-inline-hooks.sh
+          curl -fL --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.14.patch" \
+            -o ../susfs-4.14.patch
 
-          echo "Applying main 4.14 SUSFS patch..."
           set +e
           patch -p1 --forward --batch < ../susfs-4.14.patch 2>&1 | tee ../susfs-main-patch.log
           PATCH_RC=${PIPESTATUS[0]}
           set -e
 
+          # Xcalibur branch 17 has exactly two known layout differences from
+          # this generic 4.14 backport. Merge only those known rejects.
           if [ "$PATCH_RC" -ne 0 ]; then
             mapfile -t rejects < <(find . -name '*.rej' -print | sort)
             printf 'Rejects found:\n%s\n' "${rejects[*]}"
@@ -165,7 +212,7 @@ jobs:
             if [ "${#rejects[@]}" -ne 2 ] || \
                [ "${rejects[0]}" != "$expected1" ] || \
                [ "${rejects[1]}" != "$expected2" ]; then
-              echo "::error::Unexpected SUSFS patch rejects. Refusing to continue."
+              echo "::error::Unexpected SUSFS kernel patch rejects"
               for f in "${rejects[@]}"; do
                 echo "===== $f ====="
                 cat "$f"
@@ -173,13 +220,11 @@ jobs:
               exit 1
             fi
 
-            echo "Applying Xcalibur-specific merge for /proc/cmdline and task_mmu include..."
             python3 - <<'PYFIX'
           from pathlib import Path
-          
+
           p = Path('fs/proc/cmdline.c')
           s = p.read_text()
-          
           decls = '''
           #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
           extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
@@ -191,7 +236,7 @@ jobs:
               if anchor not in s:
                   raise SystemExit('cmdline.c: include anchor not found')
               s = s.replace(anchor, anchor + decls, 1)
-          
+
           spoof = '''#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
           \tif (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
           \t\tsusfs_spoof_cmdline_or_bootconfig(m);
@@ -206,7 +251,7 @@ jobs:
                   raise SystemExit('cmdline.c: cmdline_proc_show anchor not found')
               s = s.replace(fn, fn + spoof, 1)
           p.write_text(s)
-          
+
           p = Path('fs/proc/task_mmu.c')
           s = p.read_text()
           inc = '''#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
@@ -222,38 +267,29 @@ jobs:
           PYFIX
 
             rm -f fs/proc/cmdline.c.rej fs/proc/task_mmu.c.rej
-            grep -q 'susfs_spoof_cmdline_or_bootconfig(m)' fs/proc/cmdline.c || { echo "::error::Xcalibur cmdline SUSFS merge failed"; exit 1; }
-            grep -q '#include <linux/susfs_def.h>' fs/proc/task_mmu.c || { echo "::error::Xcalibur task_mmu SUSFS merge failed"; exit 1; }
           fi
 
-          REJECTS="$(find . -name '*.rej' -print)"
-          if [ -n "$REJECTS" ]; then
-            echo "::error::Unexpected patch reject files remain:"
-            echo "$REJECTS"
+          REMAINING="$(find . -name '*.rej' -print)"
+          if [ -n "$REMAINING" ]; then
+            echo "::error::Unexpected SUSFS reject files remain"
+            echo "$REMAINING"
             exit 1
           fi
 
-          echo "Applying legacy/non-GKI inline hooks..."
-          bash ../susfs-inline-hooks.sh 2>&1 | tee ../susfs-inline-hooks.log
-
-          if grep -q "patch failed for unknown reasons" ../susfs-inline-hooks.log; then
-            echo "::error::The inline-hook helper reported at least one failed hook insertion."
-            exit 1
-          fi
-
-          grep -q 'ksu_handle_execveat_sucompat' fs/exec.c || { echo "::error::exec hook missing"; exit 1; }
-          grep -q 'ksu_handle_faccessat' fs/open.c || { echo "::error::faccessat hook missing"; exit 1; }
-          grep -q 'ksu_handle_stat' fs/stat.c || { echo "::error::stat hook missing"; exit 1; }
-          grep -q 'ksu_handle_input_handle_event' drivers/input/input.c || { echo "::error::input hook missing"; exit 1; }
-          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || { echo "::error::reboot hook missing"; exit 1; }
-
-          sha256sum ../susfs-4.14.patch ../susfs-inline-hooks.sh > ../susfs-patches.sha256
           test -f fs/susfs.c
           test -f include/linux/susfs.h
+          SUSFS_VERSION_LINE="$(grep -E '^#define[[:space:]]+SUSFS_VERSION' include/linux/susfs.h | head -n1 || true)"
+          echo "${SUSFS_VERSION_LINE}" | tee ../diagnostics/susfs-version.txt
+          if ! echo "$SUSFS_VERSION_LINE" | grep -Eq 'v2\.[23]\.'; then
+            echo "::error::Expected SUSFS >=2.2; detected: ${SUSFS_VERSION_LINE:-unknown}"
+            exit 1
+          fi
 
-      - name: Configure KSU and SUSFS
+          sha256sum ../susfs-4.14.patch ../ksu-enable-susfs.patch > ../susfs-patches.sha256
+
+      - name: Configure original KernelSU hooks plus SUSFS
         run: |
-          set -e
+          set -euo pipefail
           cd kernel
           DEFCONFIG="arch/arm64/configs/${DEFCONFIG_NAME}"
           test -f "$DEFCONFIG"
@@ -268,34 +304,55 @@ jobs:
             sed -i -e "/^${key}=/d" -e "/^# ${key} is not set/d" "$DEFCONFIG"
             echo "# ${key} is not set" >> "$DEFCONFIG"
           }
+          ksu_symbol_exists() {
+            local sym="${1#CONFIG_}"
+            grep -Eq "^[[:space:]]*(menu)?config[[:space:]]+${sym}([[:space:]]|$)" "${KSU_KERNEL_DIR}/Kconfig"
+          }
+          set_y_if_exists() {
+            if ksu_symbol_exists "$1"; then
+              set_y "$1"
+              echo "enabled optional $1"
+            else
+              echo "optional $1 not present in this KSU tree"
+            fi
+          }
+          set_n_if_exists() {
+            if ksu_symbol_exists "$1"; then
+              set_n "$1"
+              echo "disabled optional $1"
+            fi
+          }
 
+          # Preserve the root hook strategy from the known-good Sep-30 build.
           set_y CONFIG_KSU
           set_y CONFIG_KPROBES
           set_y CONFIG_KPROBE_EVENTS
-          set_y CONFIG_KRETPROBES
+          set_y CONFIG_KSU_KPROBE_HOOKS
           set_y CONFIG_OVERLAY_FS
+          set_y CONFIG_KSU_TAMPER_SYSCALL_TABLE
 
-          # ReSukiSU SUSFS inline-hook mode. Do not enable a second hook mode.
+          # Add SUSFS, without changing the existing KSU hook family.
           set_y CONFIG_KSU_SUSFS
-          set_n CONFIG_KSU_MANUAL_HOOK
-          set_n CONFIG_KSU_TRACEPOINT_HOOK
-          set_n CONFIG_KSU_KPROBES_HOOK
+          set_y_if_exists CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+          set_y_if_exists CONFIG_KSU_SUSFS_SUS_PATH
+          set_y_if_exists CONFIG_KSU_SUSFS_SUS_MOUNT
+          set_y_if_exists CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          set_y_if_exists CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          set_y_if_exists CONFIG_KSU_SUSFS_SUS_KSTAT
+          set_y_if_exists CONFIG_KSU_SUSFS_TRY_UMOUNT
+          set_y_if_exists CONFIG_KSU_SUSFS_SPOOF_UNAME
+          set_y_if_exists CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          set_y_if_exists CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          set_y_if_exists CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          set_y_if_exists CONFIG_KSU_SUSFS_SUS_MAP
+          set_n_if_exists CONFIG_KSU_SUSFS_ENABLE_LOG
+          set_n_if_exists CONFIG_KSU_SUSFS_SUS_SU
 
-          set_y CONFIG_KSU_SUSFS_SUS_PATH
-          set_y CONFIG_KSU_SUSFS_SUS_MOUNT
-          set_y CONFIG_KSU_SUSFS_SUS_KSTAT
-          set_y CONFIG_KSU_SUSFS_SPOOF_UNAME
-          set_n CONFIG_KSU_SUSFS_ENABLE_LOG
-          set_y CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-          set_y CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          set_y CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          set_y CONFIG_KSU_SUSFS_SUS_MAP
-
-          tail -n 50 "$DEFCONFIG"
+          tail -n 80 "$DEFCONFIG" > ../diagnostics/defconfig-tail.txt
 
       - name: Compile kernel
         run: |
-          set -e
+          set -euo pipefail
           CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/${CLANG_VERSION}/bin"
           export PATH="/usr/lib/ccache:${CLANG_ROOT}:$PATH"
           export CC="ccache ${CLANG_ROOT}/clang"
@@ -320,24 +377,20 @@ jobs:
           touch ./.scmversion
           make O=out "${DEFCONFIG_NAME}" CLANG_TRIPLE=aarch64-linux-gnu-
           make O=out olddefconfig CLANG_TRIPLE=aarch64-linux-gnu-
-
           cp out/.config ../diagnostics/final.config
-          echo "===== Final KSU / SUSFS config ====="
-          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_TRACEPOINT_HOOK|CONFIG_KSU_KPROBES_HOOK|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_OVERLAY_FS)' out/.config || true
-          echo "===================================="
+
+          echo "===== Final KernelSU / SUSFS config ====="
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_KPROBE_HOOKS|CONFIG_KSU_TAMPER_SYSCALL_TABLE|CONFIG_KPROBES|CONFIG_OVERLAY_FS)' out/.config || true
+          echo "========================================="
 
           required=(
-            CONFIG_THREAD_INFO_IN_TASK
             CONFIG_KSU
+            CONFIG_KPROBES
+            CONFIG_KPROBE_EVENTS
+            CONFIG_KSU_KPROBE_HOOKS
+            CONFIG_OVERLAY_FS
+            CONFIG_KSU_TAMPER_SYSCALL_TABLE
             CONFIG_KSU_SUSFS
-            CONFIG_KSU_SUSFS_SUS_PATH
-            CONFIG_KSU_SUSFS_SUS_MOUNT
-            CONFIG_KSU_SUSFS_SUS_KSTAT
-            CONFIG_KSU_SUSFS_SPOOF_UNAME
-            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-            CONFIG_KSU_SUSFS_OPEN_REDIRECT
-            CONFIG_KSU_SUSFS_SUS_MAP
           )
           for key in "${required[@]}"; do
             if ! grep -q "^${key}=y$" out/.config; then
@@ -350,37 +403,39 @@ jobs:
           make -j"$(nproc)" O=out CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
           status=${PIPESTATUS[0]}
           set -e
-
-          # Capture KSU object symbol information even if final link fails.
-          if [ -f out/drivers/kernelsu/ksu.o ]; then
-            "${CLANG_ROOT}/llvm-nm" out/drivers/kernelsu/ksu.o 2>/dev/null | \
-              grep -E 'ksu_handle_|ksu_su_compat|ksu_is_init_rc|ksu_is_input' \
-              > ../diagnostics/ksu-object-symbols.txt || true
-          fi
-
           if [ "$status" -ne 0 ]; then
             echo "::error::Kernel compilation failed"
             exit "$status"
           fi
 
-      - name: Verify built kernel really contains SUSFS
+      - name: Verify built image contains KernelSU and SUSFS
         run: |
-          set -e
+          set -euo pipefail
           BOOT_DIR="kernel/out/arch/arm64/boot"
           test -s "${BOOT_DIR}/Image.gz"
           gzip -dc "${BOOT_DIR}/Image.gz" > built-Image
 
-          strings built-Image | grep -m1 -A1 'Linux version' || true
-          strings built-Image | grep -Ei -m10 'susfs is initialized|susfs_show_version|susfs_add_sus_path|susfs_add_sus_map' || true
+          {
+            echo "===== kernel banner ====="
+            strings built-Image | grep -m1 'Linux version' || true
+            echo "===== SUSFS markers ====="
+            strings built-Image | grep -Ei -m20 'susfs is initialized|susfs_show_version|susfs_add_sus_path|susfs_add_sus_map|SUSFS_VERSION' || true
+            echo "===== KernelSU markers ====="
+            strings built-Image | grep -Ei -m20 'KernelSU:|selinux_hide|KSU ioctl' || true
+          } | tee diagnostics/built-image-markers.txt
 
-          if ! strings built-Image | grep -q 'susfs is initialized'; then
-            echo "::error::Compiled image does not contain the SUSFS init marker"
+          strings built-Image | grep -q 'susfs is initialized' || {
+            echo "::error::Built kernel has no SUSFS init marker"
             exit 1
-          fi
+          }
+          strings built-Image | grep -q 'KernelSU:' || {
+            echo "::error::Built kernel has no KernelSU marker"
+            exit 1
+          }
 
-      - name: Package with known-good Sep-30 DTB/DTBO
+      - name: Package with proven Sep-30 DTB DTBO and installer
         run: |
-          set -e
+          set -euo pipefail
           rm -rf package
           cp -a known-good-sep30 package
           cp kernel/out/arch/arm64/boot/Image.gz package/Image.gz
@@ -393,40 +448,56 @@ jobs:
           echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
           sha256sum "${ZIP_NAME}.zip" | tee "${ZIP_NAME}.sha256"
           cp kernel/out/.config "${ZIP_NAME}.config"
+
           printf '%s\n' \
             "kernel_source=${KERNEL_SOURCE}" \
             "kernel_ref=${KERNEL_BRANCH}" \
             "kernel_source_sha=${KERNEL_SOURCE_SHA}" \
-            "resukisu_repo_detected_via=drivers/kernelsu" \
-            "resukisu_ref=${RESUKISU_BRANCH}" \
-            "resukisu_sha=${RESUKISU_SHA}" \
-            "susfs_patch_commit=${SUSFS_PATCH_COMMIT}" \
+            "ksu_repo=https://github.com/Justadeayo/KernelSU" \
+            "ksu_ref=${KSU_REF}" \
+            "ksu_sha=${KSU_SHA}" \
+            "ksu_version_detected=${KSU_VERSION_DETECTED}" \
+            "susfs_upstream_branch=${SUSFS_UPSTREAM_BRANCH}" \
+            "susfs_upstream_sha=${SUSFS_UPSTREAM_SHA}" \
+            "susfs_4.14_patch_commit=${SUSFS_PATCH_COMMIT}" \
             "compiler=${CLANG_VERSION}" \
+            "known_good_sep30_package_sha256=858e34f51bbef6ae9ae5e9fbdc1571b91845eca0cd2ad1800a7bad281d33b569" \
             > "${ZIP_NAME}.provenance.txt"
 
       - name: Upload flashable kernel
         uses: actions/upload-artifact@v4
         with:
-          name: xcalibur-violet-resukisu-susfs
+          name: xcalibur-violet-kernelsu-susfs
           path: |
             ${{ env.ZIP_NAME }}.zip
             ${{ env.ZIP_NAME }}.sha256
             ${{ env.ZIP_NAME }}.config
             ${{ env.ZIP_NAME }}.provenance.txt
             susfs-patches.sha256
+            diagnostics/built-image-markers.txt
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p diagnostics
+          cp kernelsu-setup.log diagnostics/ 2>/dev/null || true
+          cp ksu-susfs-patch.log diagnostics/ 2>/dev/null || true
+          cp susfs-main-patch.log diagnostics/ 2>/dev/null || true
+          cp susfs-4.14.patch diagnostics/ 2>/dev/null || true
+          cp ksu-enable-susfs.patch diagnostics/ 2>/dev/null || true
+          cp build.log diagnostics/ 2>/dev/null || true
+          find kernel -name '*.rej' -exec cp --parents '{}' diagnostics/ \; 2>/dev/null || true
+          find kernel -name '*.orig' -exec cp --parents '{}' diagnostics/ \; 2>/dev/null || true
+          if [ -n "${KSU_REPO_DIR:-}" ] && [ -d "${KSU_REPO_DIR:-}" ]; then
+            grep -RhoE 'ksu_handle_[A-Za-z0-9_]+' "${KSU_KERNEL_DIR:-$KSU_REPO_DIR}" 2>/dev/null | sort -u \
+              > diagnostics/ksu-hook-symbols-at-failure.txt || true
+          fi
+          find diagnostics -maxdepth 5 -type f -printf '%p\n' | sort
 
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: xcalibur-susfs-failure-logs
-          path: |
-            resukisu-setup.log
-            diagnostics/**
-            susfs-main-patch.log
-            susfs-4.14.patch
-            susfs-inline-hooks.log
-            build.log
-            kernel/**/*.rej
-            kernel/**/*.orig
-          if-no-files-found: warn
+          path: diagnostics/
+          if-no-files-found: error
