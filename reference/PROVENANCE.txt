@@ -1,0 +1,10 @@
+Builder source archive root commit shown by the uploaded GitHub source ZIP:
+99be34b17e5a2105555433aafecebbd784b8cb22
+
+Known-good kernel package SHA-256:
+858e34f51bbef6ae9ae5e9fbdc1571b91845eca0cd2ad1800a7bad281d33b569
+
+Known-good running banner extracted from Image.gz:
+Linux version 4.14.366-openela-xcalibur-5.4
+Clang 12.0.5 based on r416183b
+Build time: Wed Sep 30 01:25:49 WAT 2026

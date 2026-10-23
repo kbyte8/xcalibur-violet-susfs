@@ -1,0 +1,8 @@
+Known-good uploaded package:
+858e34f51bbef6ae9ae5e9fbdc1571b91845eca0cd2ad1800a7bad281d33b569  Xcalibur_violet_KernelSU_20260930_0126.zip
+
+Files preserved in known-good-sep30/:
+5c48d4b4d2112c9af8a2f9b543996bb410eb6ddc6a2fd65c02101a46b8e68569  dtb
+1cb8c6023fee3a1a75624129bff66552e165e2328903a8fbefe68306253d77ad  dtbo.img
+43c612502d3f4f5a4fd4de419bccc394781ab55f100e8ea1e2c7d2ab11e16751  anykernel.sh
+f2f2aca733fd5c385913a4dc22233655db41feae079aae47824e17c3ac8b8c42  tools/ak3-core.sh
