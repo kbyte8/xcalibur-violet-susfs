@@ -1,0 +1,301 @@
+name: Xcalibur Violet - ReSukiSU + SUSFS 2.3
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: "Africa/Lagos"
+  CLANG_VERSION: "clang-r416183b"
+  KERNEL_SOURCE: "https://github.com/Justadeayo/android_kernel_xiaomi_violet"
+  KERNEL_BRANCH: "17"
+  DEFCONFIG_NAME: "vendor/violet-perf_defconfig"
+  DEVICE_CODENAME: "violet"
+  KERNEL_NAME: "Xcalibur-violet-ReSukiSU-SUSFS"
+  # Pin the SUSFS patch set to the Sep-30-era NonGKI builder revision.
+  SUSFS_PATCH_COMMIT: "e2f895b"
+  RESUKISU_BRANCH: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout modified builder
+        uses: actions/checkout@v4
+
+      - name: Setup swap
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: xcalibur-violet-susfs
+          max-size: 5G
+
+      - name: Install build dependencies
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/*
+          sudo apt-get -o Acquire::Timeout="10" -o Acquire::Retries="2" update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libdw-dev build-essential \
+            lz4 git python3 curl dwarves cpio lld gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi zip patch
+
+      - name: Clone exact Xcalibur source family
+        run: |
+          rm -rf kernel
+          git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_SOURCE}" kernel
+          cd kernel
+          echo "KERNEL_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Kernel source: $(git rev-parse HEAD)"
+          echo "Kernel version: $(make kernelversion)"
+
+      - name: Download same Clang family as Sep-30 build
+        run: |
+          mkdir -p "toolchains/${CLANG_VERSION}"
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git \
+            "toolchains/${CLANG_VERSION}"
+          test -x "toolchains/${CLANG_VERSION}/bin/clang"
+          "toolchains/${CLANG_VERSION}/bin/clang" --version | head -n 1
+
+      - name: Integrate ReSukiSU
+        run: |
+          cd kernel
+          curl -fL --retry 3 \
+            "https://raw.githubusercontent.com/Justadeayo/sKernelSU/${RESUKISU_BRANCH}/kernel/setup.sh" \
+            -o setup.sh
+          bash setup.sh "${RESUKISU_BRANCH}"
+          test -d KernelSU
+          echo "RESUKISU_SHA=$(git -C KernelSU rev-parse HEAD)" >> "$GITHUB_ENV"
+          grep -q 'config KSU_SUSFS' KernelSU/kernel/Kconfig || {
+            echo "::error::Selected ReSukiSU tree does not expose CONFIG_KSU_SUSFS"
+            exit 1
+          }
+
+      - name: Download and apply SUSFS 2.3 kernel patches
+        run: |
+          set -e
+          cd kernel
+          PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/${SUSFS_PATCH_COMMIT}/Patches"
+          curl -fL --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.14.patch" -o ../susfs-4.14.patch
+          curl -fL --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o ../susfs-inline-hooks.sh
+          chmod +x ../susfs-inline-hooks.sh
+
+          echo "Testing main 4.14 SUSFS patch..."
+          if ! patch --dry-run -p1 < ../susfs-4.14.patch; then
+            echo "::error::SUSFS 4.14 patch does not apply cleanly to this Xcalibur source."
+            exit 1
+          fi
+          patch -p1 < ../susfs-4.14.patch
+
+          echo "Applying legacy/non-GKI inline hooks..."
+          bash ../susfs-inline-hooks.sh | tee ../susfs-inline-hooks.log
+
+          if grep -q "patch failed for unknown reasons" ../susfs-inline-hooks.log; then
+            echo "::error::The inline-hook helper reported at least one failed hook insertion."
+            exit 1
+          fi
+
+          # These are core legacy hooks expected on a 4.14 ReSukiSU/SUSFS build.
+          grep -q 'ksu_handle_execveat_sucompat' fs/exec.c || { echo "::error::exec hook missing"; exit 1; }
+          grep -q 'ksu_handle_faccessat' fs/open.c || { echo "::error::faccessat hook missing"; exit 1; }
+          grep -q 'ksu_handle_stat' fs/stat.c || { echo "::error::stat hook missing"; exit 1; }
+          grep -q 'ksu_handle_input_handle_event' drivers/input/input.c || { echo "::error::input hook missing"; exit 1; }
+          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c || { echo "::error::reboot hook missing"; exit 1; }
+
+          sha256sum ../susfs-4.14.patch ../susfs-inline-hooks.sh > ../susfs-patches.sha256
+
+          REJECTS="$(find . -name '*.rej' -print)"
+          if [ -n "$REJECTS" ]; then
+            echo "::error::Patch reject files were created:"
+            echo "$REJECTS"
+            for f in $REJECTS; do
+              echo "===== $f ====="
+              cat "$f"
+            done
+            exit 1
+          fi
+
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
+          grep -q 'SUSFS_VERSION' include/linux/susfs.h
+
+      - name: Configure KSU and SUSFS
+        run: |
+          set -e
+          cd kernel
+          DEFCONFIG="arch/arm64/configs/${DEFCONFIG_NAME}"
+          test -f "$DEFCONFIG"
+
+          set_y() {
+            key="$1"
+            sed -i -e "/^${key}=/d" -e "/^# ${key} is not set/d" "$DEFCONFIG"
+            echo "${key}=y" >> "$DEFCONFIG"
+          }
+          set_n() {
+            key="$1"
+            sed -i -e "/^${key}=/d" -e "/^# ${key} is not set/d" "$DEFCONFIG"
+            echo "# ${key} is not set" >> "$DEFCONFIG"
+          }
+
+          # Root integration: preserve the 4.14-friendly syscall-table hook strategy.
+          set_y CONFIG_KSU
+          set_y CONFIG_KSU_TAMPER_SYSCALL_TABLE
+          set_n CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+          set_n CONFIG_KSU_KPROBES_KSUD
+          set_y CONFIG_KPROBES
+          set_y CONFIG_KPROBE_EVENTS
+          set_y CONFIG_KRETPROBES
+          set_y CONFIG_OVERLAY_FS
+
+          # SUSFS features BRENE can use.
+          set_y CONFIG_KSU_SUSFS
+          set_y CONFIG_KSU_SUSFS_SUS_PATH
+          set_y CONFIG_KSU_SUSFS_SUS_MOUNT
+          set_y CONFIG_KSU_SUSFS_SUS_KSTAT
+          set_y CONFIG_KSU_SUSFS_SPOOF_UNAME
+          set_n CONFIG_KSU_SUSFS_ENABLE_LOG
+          set_y CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          set_y CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          set_y CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          set_y CONFIG_KSU_SUSFS_SUS_MAP
+
+          tail -n 40 "$DEFCONFIG"
+
+      - name: Compile kernel
+        run: |
+          set -e
+          CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/${CLANG_VERSION}/bin"
+          export PATH="/usr/lib/ccache:${CLANG_ROOT}:$PATH"
+          export CC="ccache ${CLANG_ROOT}/clang"
+          export CXX="ccache ${CLANG_ROOT}/clang++"
+          export HOSTCC="ccache ${CLANG_ROOT}/clang"
+          export HOSTCXX="ccache ${CLANG_ROOT}/clang++"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export LD="${CLANG_ROOT}/ld.lld"
+          export AR="${CLANG_ROOT}/llvm-ar"
+          export NM="${CLANG_ROOT}/llvm-nm"
+          export OBJCOPY="${CLANG_ROOT}/llvm-objcopy"
+          export OBJDUMP="${CLANG_ROOT}/llvm-objdump"
+          export STRIP="${CLANG_ROOT}/llvm-strip"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          cd kernel
+          mkdir -p out
+          touch ./.scmversion
+          make O=out "${DEFCONFIG_NAME}" CLANG_TRIPLE=aarch64-linux-gnu-
+          make O=out olddefconfig CLANG_TRIPLE=aarch64-linux-gnu-
+
+          echo "===== Final KSU / SUSFS config ====="
+          grep -E '^(CONFIG_THREAD_INFO_IN_TASK|CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES|CONFIG_OVERLAY_FS)' out/.config || true
+          echo "===================================="
+
+          required=(
+            CONFIG_THREAD_INFO_IN_TASK
+            CONFIG_KSU
+            CONFIG_KSU_TAMPER_SYSCALL_TABLE
+            CONFIG_KSU_SUSFS
+            CONFIG_KSU_SUSFS_SUS_PATH
+            CONFIG_KSU_SUSFS_SUS_MOUNT
+            CONFIG_KSU_SUSFS_SUS_KSTAT
+            CONFIG_KSU_SUSFS_SPOOF_UNAME
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT
+            CONFIG_KSU_SUSFS_SUS_MAP
+          )
+          for key in "${required[@]}"; do
+            if ! grep -q "^${key}=y$" out/.config; then
+              echo "::error::${key}=y is missing from final .config"
+              exit 1
+            fi
+          done
+
+          set +e
+          make -j"$(nproc)" O=out CLANG_TRIPLE=aarch64-linux-gnu- 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Kernel compilation failed"
+            exit "$status"
+          fi
+
+      - name: Verify built kernel really contains SUSFS
+        run: |
+          set -e
+          BOOT_DIR="kernel/out/arch/arm64/boot"
+          test -s "${BOOT_DIR}/Image.gz"
+          gzip -dc "${BOOT_DIR}/Image.gz" > built-Image
+
+          echo "===== Kernel banner ====="
+          strings built-Image | grep -m1 -A1 'Linux version' || true
+          echo "===== SUSFS markers ====="
+          strings built-Image | grep -Ei -m10 'susfs is initialized|susfs_show_version|susfs_add_sus_path|susfs_add_sus_map' || true
+
+          if ! strings built-Image | grep -q 'susfs is initialized'; then
+            echo "::error::Compiled image does not contain the SUSFS init marker"
+            exit 1
+          fi
+          if ! strings built-Image | grep -q '4.14.366-openela-xcalibur'; then
+            echo "::warning::Built kernel banner differs from the known-good Sep-30 Xcalibur family"
+          fi
+
+      - name: Package with known-good Sep-30 DTB/DTBO
+        run: |
+          set -e
+          rm -rf package
+          cp -a known-good-sep30 package
+          cp kernel/out/arch/arm64/boot/Image.gz package/Image.gz
+
+          # Refuse to package if the proven-good device tree payload was modified.
+          echo '5c48d4b4d2112c9af8a2f9b543996bb410eb6ddc6a2fd65c02101a46b8e68569  package/dtb' | sha256sum -c -
+          echo '1cb8c6023fee3a1a75624129bff66552e165e2328903a8fbefe68306253d77ad  package/dtbo.img' | sha256sum -c -
+
+          ZIP_NAME="${KERNEL_NAME}_2.3_$(date +'%Y%m%d_%H%M')"
+          (cd package && zip -r9 "../${ZIP_NAME}.zip" .)
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+          sha256sum "${ZIP_NAME}.zip" | tee "${ZIP_NAME}.sha256"
+          cp kernel/out/.config "${ZIP_NAME}.config"
+          printf '%s\n' \
+            "kernel_source=${KERNEL_SOURCE}" \
+            "kernel_ref=${KERNEL_BRANCH}" \
+            "kernel_source_sha=${KERNEL_SOURCE_SHA}" \
+            "resukisu_repo=https://github.com/Justadeayo/sKernelSU" \
+            "resukisu_ref=${RESUKISU_BRANCH}" \
+            "resukisu_sha=${RESUKISU_SHA}" \
+            "susfs_patch_commit=${SUSFS_PATCH_COMMIT}" \
+            "compiler=${CLANG_VERSION}" \
+            "known_good_sep30_package_sha256=858e34f51bbef6ae9ae5e9fbdc1571b91845eca0cd2ad1800a7bad281d33b569" \
+            > "${ZIP_NAME}.provenance.txt"
+
+      - name: Upload flashable kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcalibur-violet-resukisu-susfs
+          path: |
+            ${{ env.ZIP_NAME }}.zip
+            ${{ env.ZIP_NAME }}.sha256
+            ${{ env.ZIP_NAME }}.config
+            ${{ env.ZIP_NAME }}.provenance.txt
+            susfs-patches.sha256
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcalibur-susfs-failure-logs
+          path: |
+            build.log
+            susfs-inline-hooks.log
+            kernel/**/*.rej
+          if-no-files-found: ignore
