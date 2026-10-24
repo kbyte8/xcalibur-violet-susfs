@@ -200,6 +200,54 @@ jobs:
           test -f include/linux/susfs.h
           grep -R "SUSFS_VERSION" -n include/linux/susfs.h | head -n 2 | tee ../diagnostics/susfs-version.txt
 
+          echo "Applying SUSFS legacy inline hooks for non-GKI 4.14..."
+          curl -fL --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o ../susfs-inline-hooks.sh
+          chmod +x ../susfs-inline-hooks.sh
+
+          set +e
+          bash ../susfs-inline-hooks.sh 2>&1 | tee ../diagnostics/susfs-inline-hooks.log
+          HOOK_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$HOOK_RC" -ne 0 ]; then
+            echo "SUSFS inline-hook helper returned $HOOK_RC" >&2
+            exit "$HOOK_RC"
+          fi
+
+          if grep -qiE 'patch failed|failed for unknown reasons|not found|cannot find' ../diagnostics/susfs-inline-hooks.log; then
+            echo "Inline-hook helper reported a failed insertion" >&2
+            cat ../diagnostics/susfs-inline-hooks.log >&2
+            exit 1
+          fi
+
+          echo "Verifying BakaSU-required legacy hooks..."
+          required_hooks=(
+            "ksu_handle_setresuid"
+            "ksu_handle_faccessat"
+            "ksu_handle_stat"
+            "ksu_handle_execveat"
+            "ksu_handle_input_handle_event"
+          )
+          for hook in "${required_hooks[@]}"; do
+            if ! grep -Rqs "$hook"               fs kernel drivers security arch/arm64 2>/dev/null; then
+              echo "Missing required inline hook in kernel source: $hook" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "===== setresuid ====="
+            grep -Rns "ksu_handle_setresuid" kernel fs drivers 2>/dev/null | head -n 10 || true
+            echo "===== faccessat ====="
+            grep -Rns "ksu_handle_faccessat" fs kernel 2>/dev/null | head -n 10 || true
+            echo "===== stat ====="
+            grep -Rns "ksu_handle_stat" fs kernel 2>/dev/null | head -n 10 || true
+            echo "===== execveat ====="
+            grep -Rns "ksu_handle_execveat" fs kernel 2>/dev/null | head -n 10 || true
+            echo "===== input ====="
+            grep -Rns "ksu_handle_input_handle_event" drivers 2>/dev/null | head -n 10 || true
+          } > ../diagnostics/inline-hook-locations.txt
+
       - name: Configure BakaSU + SUSFS
         shell: bash
         run: |
@@ -339,4 +387,5 @@ jobs:
             kernel/**/*.rej
             kernel/**/*.orig
             susfs-4.14.patch
+            susfs-inline-hooks.sh
           if-no-files-found: warn
